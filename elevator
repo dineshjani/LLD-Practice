@@ -1,0 +1,550 @@
+⏺ Elevator System — Complete Python Implementation
+
+  ---                                                                                                                                                                                                           
+  Step 1: Enums
+                                                                                                                                                                                                                
+  from enum import Enum
+  from dataclasses import dataclass
+  from typing import List, Optional, Set
+  import math                                                                                                                                                                                                   
+  import threading
+                                                                                                                                                                                                                
+  class Direction(Enum):                                                                                                                                                                                        
+      UP = "up"
+      DOWN = "down"                                                                                                                                                                                             
+      IDLE = "idle"
+
+  class RequestType(Enum):
+      PICKUP_UP = "pickup_up"       # hall call, going up
+      PICKUP_DOWN = "pickup_down"   # hall call, going down                                                                                                                                                     
+      DESTINATION = "destination"   # button inside elevator                                                                                                                                                    
+                                                                                                                                                                                                                
+  Why RequestType separate from Direction?                                                                                                                                                                      
+                  
+  The article makes this explicit: hall calls are never IDLE, but Direction has three values including IDLE. If you reuse Direction for hall calls, you must add runtime validation everywhere: if type ==      
+  Direction.IDLE: reject. With RequestType, that invalid state literally cannot exist — the type system prevents it at construction time.
+                                                                                                                                                                                                                
+  ---             
+  Step 2: Request — Frozen, Hashable, Equality by Value
+                                                                                                                                                                                                                
+  @dataclass(frozen=True)
+  class Request:                                                                                                                                                                                                
+      floor: int  
+      request_type: RequestType                                                                                                                                                                                 
+  
+  Why frozen=True on Request?                                                                                                                                                                                   
+                  
+  Requests live in a set. Python sets require elements to be hashable. frozen=True dataclasses get a free __hash__ based on all fields. Without it, you'd need to manually implement __hash__ and __eq__, and   
+  mutable objects in sets lead to bugs when the object changes after insertion.
+                                                                                                                                                                                                                
+  Why store both floor AND request_type in Request?
+
+  This is the key design decision from the article. If you only store floor numbers, you can't distinguish:                                                                                                     
+  - Person on floor 6 going DOWN → Request(6, PICKUP_DOWN)
+  - Person on floor 6 going UP → Request(6, PICKUP_UP)                                                                                                                                                          
+  - Destination button pressed for floor 6 → Request(6, DESTINATION)
+                                                                                                                                                                                                                
+  With floor-only storage, the SCAN algorithm can't skip pickup requests that are going the wrong direction. You'd stop at floor 6 going UP to pick up someone who wants to go DOWN — they board a car going the
+   wrong way.                                                                                                                                                                                                   
+                                                                                                                                                                                                                
+  Set membership check:                                                                                                                                                                                         
+                  
+  r1 = Request(6, RequestType.PICKUP_DOWN)                                                                                                                                                                      
+  r2 = Request(6, RequestType.PICKUP_DOWN)
+  r3 = Request(6, RequestType.PICKUP_UP)                                                                                                                                                                        
+  
+  print(r1 == r2)    # True  — same floor, same type                                                                                                                                                            
+  print(r1 == r3)    # False — same floor, different type
+  print(r1 in {r2})  # True  — set deduplication works                                                                                                                                                          
+                                                                                                                                                                                                                
+  ---
+  Step 3: Elevator — The Heart of the System                                                                                                                                                                    
+                                                                                                                                                                                                                
+  NUM_FLOORS = 10   # floors 0–9
+                                                                                                                                                                                                                
+  class Elevator: 
+      def __init__(self, elevator_id: int):
+          self.elevator_id = elevator_id                                                                                                                                                                        
+          self.current_floor: int = 0
+          self.direction: Direction = Direction.IDLE                                                                                                                                                            
+          self.requests: Set[Request] = set()                                                                                                                                                                   
+  
+  Why set for requests, not list?                                                                                                                                                                               
+                  
+  Two reasons:
+  1. Deduplication: If two passengers press floor 7 in the same direction, you add Request(7, DESTINATION) twice — the set silently ignores the duplicate. With a list, you'd stop at 7, remove one entry, then
+  stop again next time around.                                                                                                                                                                                  
+  2. Set membership check: The stop logic does if Request(current_floor, pickup_type) in self.requests. With a set, this is O(1). With a list: O(n) scan.
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                           
+  Step 4: add_request — Boundary Guard
+                                                                                                                                                                                                                
+      def add_request(self, request: Request) -> bool:
+          if request.floor < 0 or request.floor >= NUM_FLOORS:                                                                                                                                                  
+              return False                                                                                                                                                                                      
+          if request.floor == self.current_floor:
+              return True     # already here — treat as no-op, doors handled by hardware                                                                                                                        
+          self.requests.add(request)                                                                                                                                                                            
+          return True
+                                                                                                                                                                                                                
+  Why return True (not False) for current-floor requests?                                                                                                                                                       
+  
+  The requirements say: "Requests for the current floor are treated as a no-op." The elevator is already there — the call succeeded logically. Returning False would suggest failure, causing the controller to 
+  try another elevator. True says "handled."
+                                                                                                                                                                                                                
+  Why validate here AND in the controller?                                                                                                                                                                      
+  
+  Defense in depth. The controller validates hall calls. add_request also validates because passengers inside the elevator press destination buttons directly — those go through add_request without passing    
+  through the controller's hall-call validation.
+                                                                                                                                                                                                                
+  ---             
+  Step 5: step — The SCAN Algorithm (5 Cases)
+                                                                                                                                                                                                                
+  This is the interview answer. Every case must be in the right order.
+                                                                                                                                                                                                                
+      def step(self) -> None:
+          # ── Case 1: Nothing to do ─────────────────────────────────────────────                                                                                                                              
+          if not self.requests:                                                                                                                                                                                 
+              self.direction = Direction.IDLE                                                                                                                                                                   
+              return                                                                                                                                                                                            
+                                                                                                                                                                                                                
+          # ── Case 2: IDLE but has requests — pick direction ────────────────────                                                                                                                              
+          if self.direction == Direction.IDLE:
+              self.direction = self._pick_initial_direction()                                                                                                                                                   
+                                                                                                                                                                                                                
+          # ── Case 3: Stop at current floor if there's a matching request ───────                                                                                                                              
+          pickup_type = (                                                                                                                                                                                       
+              RequestType.PICKUP_UP                                                                                                                                                                             
+              if self.direction == Direction.UP
+              else RequestType.PICKUP_DOWN
+          )                                                                                                                                                                                                     
+          pickup_req = Request(self.current_floor, pickup_type)
+          dest_req = Request(self.current_floor, RequestType.DESTINATION)                                                                                                                                       
+                                                                                                                                                                                                                
+          if pickup_req in self.requests or dest_req in self.requests:
+              self.requests.discard(pickup_req)                                                                                                                                                                 
+              self.requests.discard(dest_req)
+              # Note: Request(current_floor, PICKUP_DOWN) when going UP survives.                                                                                                                               
+              # It will be served on the return trip. This is correct SCAN behavior.                                                                                                                            
+              if not self.requests:                                                                                                                                                                             
+                  self.direction = Direction.IDLE                                                                                                                                                               
+              return  # Stopped this tick — don't move                                                                                                                                                          
+                                                                                                                                                                                                                
+          # ── Case 4: No requests ahead → reverse ───────────────────────────────                                                                                                                              
+          if not self._has_requests_ahead(self.direction):                                                                                                                                                      
+              self.direction = (                                                                                                                                                                                
+                  Direction.DOWN if self.direction == Direction.UP else Direction.UP                                                                                                                            
+              )
+              return  # Reversed this tick — don't move yet                                                                                                                                                     
+                  
+          # ── Case 5: Move one floor ────────────────────────────────────────────                                                                                                                              
+          if self.direction == Direction.UP:
+              self.current_floor += 1                                                                                                                                                                           
+          else:   
+              self.current_floor -= 1
+                                                                                                                                                                                                                
+  Why exactly this order?
+                                                                                                                                                                                                                
+  - Case 1 before 2: Can't pick a direction from an empty set (would crash).                                                                                                                                    
+  - Case 2 before 3: Stop-check logic reads self.direction to know which pickup_type to check. If direction is still IDLE, you'd compute PICKUP_IDLE — which doesn't exist.
+  - Case 3 before 4: We might be at a reversal point that also has a stop. Stop first, then on the next tick check direction.                                                                                   
+  - Case 4 before 5: If we're going to reverse, we don't move this tick. Otherwise you'd move AND reverse in one tick, skipping a floor.                                                                        
+                                                                                                                                                                                                                
+  Why discard instead of remove?                                                                                                                                                                                
+                                                                                                                                                                                                                
+  set.remove(x) raises KeyError if x is absent. We're calling discard(pickup_req) and discard(dest_req) unconditionally after an or check — only one might be present. discard handles both being absent        
+  gracefully.
+                                                                                                                                                                                                                
+  ---             
+  Step 6: _pick_initial_direction — Deterministic Nearest Request
+
+      def _pick_initial_direction(self) -> Direction:
+          """
+          When IDLE with requests, find the nearest request.                                                                                                                                                    
+          Tie-break: lower floor number wins (deterministic across runs).
+          """                                                                                                                                                                                                   
+          nearest: Optional[Request] = None
+          min_distance = math.inf                                                                                                                                                                               
+                                                                                                                                                                                                                
+          for req in self.requests:
+              distance = abs(req.floor - self.current_floor)                                                                                                                                                    
+              if distance < min_distance or (
+                  distance == min_distance
+                  and (nearest is None or req.floor < nearest.floor)                                                                                                                                            
+              ):
+                  min_distance = distance                                                                                                                                                                       
+                  nearest = req
+
+          return Direction.UP if nearest.floor > self.current_floor else Direction.DOWN                                                                                                                         
+  
+  Why not next(iter(self.requests))?                                                                                                                                                                            
+                  
+  set iteration order in Python is non-deterministic (depends on hash values, insertion order, Python version). Using next(iter(...)) gives a different nearest request every run, making bugs impossible to    
+  reproduce. The deterministic tie-break (lower floor wins) means the same initial state always produces the same behavior.
+                                                                                                                                                                                                                
+  ---             
+  Step 7: _has_requests_ahead — Travel vs Stop Are Different
+                                                                                                                                                                                                                
+      def _has_requests_ahead(self, direction: Direction) -> bool:
+          """                                                                                                                                                                                                   
+          Are there ANY requests above us (if going UP) or below (if going DOWN)?
+          Checks ALL request types — the elevator travels toward everything,                                                                                                                                    
+          but only stops for matching types.                                                                                                                                                                    
+          """                                                                                                                                                                                                   
+          for req in self.requests:                                                                                                                                                                             
+              if direction == Direction.UP and req.floor > self.current_floor:                                                                                                                                  
+                  return True
+              if direction == Direction.DOWN and req.floor < self.current_floor:
+                  return True                                                                                                                                                                                   
+          return False
+                                                                                                                                                                                                                
+  Why check ALL request types (not just matching ones)?                                                                                                                                                         
+  
+  This is the subtle SCAN insight. Consider: elevator at floor 4 going UP, with Request(6, PICKUP_DOWN) and Request(8, DESTINATION).                                                                            
+                  
+  - At floor 5: has_requests_ahead(UP) → True (floor 6 and 8 are ahead). Move up.                                                                                                                               
+  - At floor 6: Stop check — going UP, so check PICKUP_UP. Floor 6 has PICKUP_DOWN, not PICKUP_UP. No stop. Pass through.
+  - At floor 7: Move up.                                                                                                                                                                                        
+  - At floor 8: Stop check — DESTINATION at floor 8. Stop. Remove it. No more requests ahead.
+  - has_requests_ahead(UP) → False. Reverse to DOWN.                                                                                                                                                            
+  - At floor 6: Stop check — now going DOWN, check PICKUP_DOWN. Found. Stop. Pick up passenger.                                                                                                                 
+                                                                                                                                                                                                                
+  The elevator passes floor 6 on the way up. The person sees it go by — they pressed DOWN, so this is correct. It picks them up on the return. If _has_requests_ahead filtered by type, the elevator would      
+  reverse at floor 5 (seeing no PICKUP_UP requests ahead) and never reach the floor 8 destination.                                                                                                              
+                                                                                                                                                                                                                
+  ---             
+  Step 8: ElevatorController — Dispatch Logic
+
+  class ElevatorController:
+      def __init__(self, num_elevators: int = 3, num_floors: int = 10):
+          self.num_floors = num_floors                                                                                                                                                                          
+          self._elevators = [Elevator(i) for i in range(num_elevators)]
+          self._lock = threading.Lock()                                                                                                                                                                         
+                  
+      def request_elevator(self, floor: int, request_type: RequestType) -> bool:                                                                                                                                
+          """Hall call: someone on a floor pressed UP or DOWN."""
+          # Hall calls can only be PICKUP_UP or PICKUP_DOWN                                                                                                                                                     
+          if request_type == RequestType.DESTINATION:                                                                                                                                                           
+              return False                                                                                                                                                                                      
+          if floor < 0 or floor >= self.num_floors:                                                                                                                                                             
+              return False                                                                                                                                                                                      
+  
+          with self._lock:                                                                                                                                                                                      
+              request = Request(floor, request_type)
+              best = self._select_best_elevator(request)
+              return best.add_request(request)                                                                                                                                                                  
+  
+      def select_floor(self, elevator_id: int, floor: int) -> bool:                                                                                                                                             
+          """Passenger inside elevator presses a destination floor button."""
+          if floor < 0 or floor >= self.num_floors:                                                                                                                                                             
+              return False
+          elevator = self._elevators[elevator_id]                                                                                                                                                               
+          with self._lock:                                                                                                                                                                                      
+              return elevator.add_request(Request(floor, RequestType.DESTINATION))
+                                                                                                                                                                                                                
+      def step(self) -> None:
+          """Advance simulation by one tick."""
+          with self._lock:                                                                                                                                                                                      
+              for elevator in self._elevators:
+                  elevator.step()                                                                                                                                                                               
+                  
+  ---
+  Step 9: Dispatch — Nearest Elevator (Simple → Sophisticated)
+                                                                                                                                                                                                                
+  Simple: Nearest idle or nearest elevator
+                                                                                                                                                                                                                
+      def _select_best_elevator(self, request: Request) -> Elevator:
+          """                                                                                                                                                                                                   
+          Simple strategy: pick the elevator closest to the requested floor.
+          Tiebreak: lower elevator_id wins.                                                                                                                                                                     
+          """                                                                                                                                                                                                   
+          return min(                                                                                                                                                                                           
+              self._elevators,                                                                                                                                                                                  
+              key=lambda e: (
+                  abs(e.current_floor - request.floor),                                                                                                                                                         
+                  e.elevator_id,
+              ),                                                                                                                                                                                                
+          )       
+
+  Sophisticated: Priority tier (what senior candidates discuss)                                                                                                                                                 
+  
+      def _select_best_elevator(self, request: Request) -> Elevator:                                                                                                                                            
+          """     
+          Priority tier dispatch (SCAN-aware):
+          Tier 1: Elevator already heading toward the request AND will pass it                                                                                                                                  
+          Tier 2: Idle elevator, nearest first                                                                                                                                                                  
+          Tier 3: Any elevator, nearest first (fallback)                                                                                                                                                        
+          """                                                                                                                                                                                                   
+          going_right_way = []                                                                                                                                                                                  
+          idle = []                                                                                                                                                                                             
+                                                                                                                                                                                                                
+          for e in self._elevators:
+              if self._is_elevator_heading_toward(e, request):                                                                                                                                                  
+                  going_right_way.append(e)
+              elif e.direction == Direction.IDLE:                                                                                                                                                               
+                  idle.append(e)
+                                                                                                                                                                                                                
+          # Tier 1: elevator en-route in the right direction                                                                                                                                                    
+          if going_right_way:
+              return min(                                                                                                                                                                                       
+                  going_right_way,
+                  key=lambda e: abs(e.current_floor - request.floor),
+              )                                                                                                                                                                                                 
+  
+          # Tier 2: idle elevator, pick nearest                                                                                                                                                                 
+          if idle:
+              return min(
+                  idle,
+                  key=lambda e: (abs(e.current_floor - request.floor), e.elevator_id),
+              )                                                                                                                                                                                                 
+  
+          # Tier 3: fallback — nearest elevator regardless of state                                                                                                                                             
+          return min(
+              self._elevators,                                                                                                                                                                                  
+              key=lambda e: (abs(e.current_floor - request.floor), e.elevator_id),
+          )                                                                                                                                                                                                     
+  
+      def _is_elevator_heading_toward(self, elevator: 'Elevator', request: Request) -> bool:                                                                                                                    
+          """     
+          Returns True if this elevator is already moving toward the request
+          AND the request floor is still ahead of it.                                                                                                                                                           
+          """                                                                                                                                                                                                   
+          if elevator.direction == Direction.UP and request.request_type == RequestType.PICKUP_UP:                                                                                                              
+              return elevator.current_floor <= request.floor                                                                                                                                                    
+          if elevator.direction == Direction.DOWN and request.request_type == RequestType.PICKUP_DOWN:                                                                                                          
+              return elevator.current_floor >= request.floor
+          return False                                                                                                                                                                                          
+                  
+  Why tiers?                                                                                                                                                                                                    
+  
+  Penalty scores (score = distance + some_arbitrary_weight) are fragile — you tune constants for one scenario and break another. Tiers encode real priority: an elevator already going your way and passing your
+   floor is always better than any idle elevator, which is always better than a going-the-wrong-way elevator. No magic numbers.
+                                                                                                                                                                                                                
+  ---             
+  Step 10: Full Walkthrough — Real Numbers Tick by Tick
+                                                       
+  # ─── Setup ───────────────────────────────────────────────────────────────────
+  controller = ElevatorController(num_elevators=3, num_floors=10)                                                                                                                                               
+  e = controller._elevators[0]   # watch elevator 0
+                                                                                                                                                                                                                
+  # ─── Initial state ───────────────────────────────────────────────────────────
+  print(f"Floor: {e.current_floor}, Dir: {e.direction}")   # Floor: 0, Dir: IDLE                                                                                                                                
+                                                                                                                                                                                                                
+  # Hall call: floor 5, going UP                                                                                                                                                                                
+  controller.request_elevator(5, RequestType.PICKUP_UP)                                                                                                                                                         
+  # Inside elevator: someone pressed 7                                                                                                                                                                          
+  controller.select_floor(0, 7)                                                                                                                                                                                 
+  
+  print(f"Requests: {e.requests}")                                                                                                                                                                              
+  # {Request(floor=5, PICKUP_UP), Request(floor=7, DESTINATION)}
+                                                                                                                                                                                                                
+  # ─── Simulate ticks ──────────────────────────────────────────────────────────
+  def show(tick, e):                                                                                                                                                                                            
+      print(f"Tick {tick}: floor={e.current_floor}, dir={e.direction.value}, requests={[(r.floor, r.request_type.value) for r in e.requests]}")                                                                 
+                                                                                                                                                                                                                
+  show(0, e)   # floor=0, dir=IDLE, has requests → will pick UP direction                                                                                                                                       
+  controller.step()                                                                                                                                                                                             
+  show(1, e)   # floor=1, dir=UP   (moved from 0→1, no stop)                                                                                                                                                    
+  controller.step()                                                                                                                                                                                             
+  show(2, e)   # floor=2, dir=UP
+  controller.step()                                                                                                                                                                                             
+  show(3, e)   # floor=3, dir=UP
+  controller.step()
+  show(4, e)   # floor=4, dir=UP
+  controller.step()                                                                                                                                                                                             
+  show(5, e)   # floor=5, dir=UP   ← STOP! PICKUP_UP removed. Requests: {(7, DEST)}
+  controller.step()                                                                                                                                                                                             
+  show(6, e)   # floor=6, dir=UP   (moved, no stop at 6)
+  controller.step()                                                                                                                                                                                             
+  show(7, e)   # floor=7, dir=UP   ← STOP! DESTINATION removed. Requests: {} → IDLE
+  controller.step()                                                                                                                                                                                             
+  show(8, e)   # floor=7, dir=IDLE (nothing to do)
+                                                                                                                                                                                                                
+  # ─── New hall call while idle ─────────────────────────────────────────────────                                                                                                                              
+  controller.request_elevator(2, RequestType.PICKUP_DOWN)                                                                                                                                                       
+  controller.step()                                                                                                                                                                                             
+  show(9, e)   # floor=6, dir=DOWN (picked DOWN direction → moved 7→6)
+  controller.step()                                                                                                                                                                                             
+  show(10, e)  # floor=5
+  controller.step()                                                                                                                                                                                             
+  show(11, e)  # floor=4
+  controller.step()
+  show(12, e)  # floor=3                                                                                                                                                                                        
+  controller.step()
+  show(13, e)  # floor=2, dir=DOWN ← STOP! PICKUP_DOWN removed. IDLE.                                                                                                                                           
+                                                                                                                                                                                                                
+  Tick 5 explained in detail:                                                                                                                                                                                   
+                                                                                                                                                                                                                
+  current_floor = 5, direction = UP                                                                                                                                                                             
+  pickup_type = PICKUP_UP
+  pickup_req = Request(5, PICKUP_UP)     ← in requests? YES
+  dest_req   = Request(5, DESTINATION)   ← in requests? NO                                                                                                                                                      
+                                                                                                                                                                                                                
+  → discard(pickup_req): requests now = {Request(7, DESTINATION)}                                                                                                                                               
+  → requests not empty → stay UP                                                                                                                                                                                
+  → return (don't move this tick)                                                                                                                                                                               
+                  
+  Tick 7 explained:                                                                                                                                                                                             
+                  
+  current_floor = 7, direction = UP                                                                                                                                                                             
+  pickup_req = Request(7, PICKUP_UP)    ← in requests? NO
+  dest_req   = Request(7, DESTINATION) ← in requests? YES
+                                                                                                                                                                                                                
+  → discard(dest_req): requests now = {}
+  → requests empty → direction = IDLE                                                                                                                                                                           
+  → return (don't move this tick)
+
+  ---                                                                                                                                                                                                           
+  Step 11: PICKUP_DOWN Passed on the Way Up — Correctness Demo
+                                                                                                                                                                                                                
+  e2 = Elevator(99)
+  e2.current_floor = 4                                                                                                                                                                                          
+  e2.direction = Direction.UP
+  e2.requests = {                                                                                                                                                                                               
+      Request(6, RequestType.PICKUP_DOWN),   # wants to go down, we're going up
+      Request(8, RequestType.DESTINATION),                                                                                                                                                                      
+  }               
+                                                                                                                                                                                                                
+  for tick in range(10):
+      show(tick, e2)
+      e2.step()
+                                                                                                                                                                                                                
+  # Tick 0: floor=4, UP — move
+  # Tick 1: floor=5, UP — no stop (no PICKUP_UP or DEST at 5)                                                                                                                                                   
+  # Tick 2: floor=6, UP — check PICKUP_UP at 6: NO. Check DEST at 6: NO. Pass through!                                                                                                                          
+  #         has_requests_ahead(UP)? floor 8 > 6 → YES. Move.                                                                                                                                                    
+  # Tick 3: floor=7, UP — no stop                                                                                                                                                                               
+  # Tick 4: floor=8, UP — check DEST at 8: YES. Stop. Remove. Requests={Request(6, DOWN)}                                                                                                                       
+  #         has_requests_ahead? no. Return (don't move).                                                                                                                                                        
+  # Tick 5: floor=8, UP — no requests ahead → REVERSE to DOWN. Return.                                                                                                                                          
+  # Tick 6: floor=8, DOWN — check PICKUP_DOWN at 8: NO. has_requests_ahead(DOWN)? YES (floor 6). Move.                                                                                                          
+  # Tick 7: floor=7, DOWN — no stop                                                                                                                                                                             
+  # Tick 8: floor=6, DOWN — check PICKUP_DOWN at 6: YES. Stop. Remove. IDLE.                                                                                                                                    
+                                                                                                                                                                                                                
+  The passenger on floor 6 saw the elevator pass going up. Correct — they pressed DOWN. They board on the return trip.                                                                                          
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                           
+  Step 12: Thread Safety — Concurrent Hall Calls
+                                                                                                                                                                                                                
+  import threading
+                                                                                                                                                                                                                
+  controller2 = ElevatorController(num_elevators=3, num_floors=10)                                                                                                                                              
+  barrier = threading.Barrier(5)
+  results = []                                                                                                                                                                                                  
+                  
+  def hall_call(floor, rtype):                                                                                                                                                                                  
+      barrier.wait()   # all 5 requests fire simultaneously
+      ok = controller2.request_elevator(floor, rtype)                                                                                                                                                           
+      results.append((floor, ok))
+                                                                                                                                                                                                                
+  threads = [     
+      threading.Thread(target=hall_call, args=(3, RequestType.PICKUP_UP)),
+      threading.Thread(target=hall_call, args=(7, RequestType.PICKUP_DOWN)),                                                                                                                                    
+      threading.Thread(target=hall_call, args=(5, RequestType.PICKUP_UP)),
+      threading.Thread(target=hall_call, args=(1, RequestType.PICKUP_DOWN)),                                                                                                                                    
+      threading.Thread(target=hall_call, args=(9, RequestType.PICKUP_UP)),
+  ]                                                                                                                                                                                                             
+  for t in threads: t.start()
+  for t in threads: t.join()                                                                                                                                                                                    
+                  
+  print(f"All succeeded: {all(r[1] for r in results)}")   # True                                                                                                                                                
+  
+  What the lock protects:                                                                                                                                                                                       
+                  
+  Without self._lock in request_elevator, two threads both call _select_best_elevator simultaneously, both see elevator 0 as the best option, both call elevator_0.add_request(...). Since set.add is not atomic
+   in CPython under multi-threaded use, you can get silent data loss. The lock serializes select + add as an atomic unit.
+                                                                                                                                                                                                                
+  ---             
+  Step 13: Extensibility — Express Elevator
+                                           
+  class ExpressElevator(Elevator):
+      EXPRESS_FLOORS = {0, 5, 9}                                                                                                                                                                                
+                                                                                                                                                                                                                
+      def add_request(self, request: Request) -> bool:                                                                                                                                                          
+          if request.floor not in self.EXPRESS_FLOORS:                                                                                                                                                          
+              return False    # reject non-express floors
+          return super().add_request(request)                                                                                                                                                                   
+  
+                                                                                                                                                                                                                
+  class ExpressController(ElevatorController):
+      def __init__(self):                                                                                                                                                                                       
+          super().__init__(num_elevators=2, num_floors=10)
+          self._express = ExpressElevator(elevator_id=99)
+                                                                                                                                                                                                                
+      def request_elevator(self, floor: int, request_type: RequestType) -> bool:
+          if request_type == RequestType.DESTINATION:                                                                                                                                                           
+              return False
+          if floor < 0 or floor >= self.num_floors:
+              return False                                                                                                                                                                                      
+  
+          with self._lock:                                                                                                                                                                                      
+              request = Request(floor, request_type)
+              # Express elevator gets priority for express floors when idle
+              if (floor in ExpressElevator.EXPRESS_FLOORS                                                                                                                                                       
+                      and self._express.direction == Direction.IDLE):                                                                                                                                           
+                  return self._express.add_request(request)                                                                                                                                                     
+              return self._select_best_elevator(request).add_request(request)                                                                                                                                   
+                                                                                                                                                                                                                
+      def step(self) -> None:
+          with self._lock:                                                                                                                                                                                      
+              for e in self._elevators:
+                  e.step()                                                                                                                                                                                      
+              self._express.step()
+                                                                                                                                                                                                                
+  No changes to Elevator.step(), Request, or any core algorithm. The override is localized to add_request (filter which floors are accepted) and the controller's dispatch (prefer express elevator for express 
+  floors).
+                                                                                                                                                                                                                
+  ---             
+  Step 14: Extensibility — Undo / Cancel a Request
+                                                                                                                                                                                                                
+      def remove_request(self, request: Request) -> bool:
+          """                                                                                                                                                                                                   
+          Cancel a queued stop. If elevator already passed or served it,
+          this is a no-op (request not in set → discard does nothing).                                                                                                                                          
+          """                                                                                                                                                                                                   
+          was_present = request in self.requests                                                                                                                                                                
+          self.requests.discard(request)                                                                                                                                                                        
+          return was_present
+
+  # Usage                                                                                                                                                                                                       
+  controller.request_elevator(8, RequestType.PICKUP_UP)
+  # ... passenger changes mind                                                                                                                                                                                  
+  ticket = Request(8, RequestType.PICKUP_UP)                                                                                                                                                                    
+  controller._elevators[0].remove_request(ticket)   # elevator will skip floor 8
+                                                                                                                                                                                                                
+  Works because state mutations are isolated to add_request/step. The movement algorithm reads self.requests dynamically each tick — removing an entry before the elevator arrives is transparent.              
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                           
+  Design Patterns Summary
+                         
+  ┌───────────────────────────┬──────────────────────────────────┬─────────────────────────────────────────────────────────────────┐
+  │          Pattern          │              Where               │                               Why                               │                                                                            
+  ├───────────────────────────┼──────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Facade                    │ ElevatorController               │ Two-method public API hides all elevator internals              │                                                                            
+  ├───────────────────────────┼──────────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ Value Object              │ Request (frozen dataclass)       │ Hashable, equality by value — safe in sets                      │                                                                            
+  ├───────────────────────────┼──────────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                            
+  │ SCAN / Elevator Algorithm │ Elevator.step()                  │ Minimize direction reversals — service all floors in one sweep  │                                                                            
+  ├───────────────────────────┼──────────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                            
+  │ Strategy (extendable)     │ _select_best_elevator            │ Swap nearest-elevator vs tier-dispatch without changing step()  │
+  ├───────────────────────────┼──────────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                            
+  │ Template Method           │ ExpressElevator extends Elevator │ Reuse entire movement algorithm, override only add_request gate │
+  ├───────────────────────────┼──────────────────────────────────┼─────────────────────────────────────────────────────────────────┤                                                                            
+  │ Separate Enums            │ Direction + RequestType          │ Hall calls can't be IDLE — enforced at type level, not runtime  │
+  └───────────────────────────┴──────────────────────────────────┴─────────────────────────────────────────────────────────────────┘                                                                            
+                  
+  ---                                                                                                                                                                                                           
+  Key Points to Say in Interview
+                                
+  ▎ "I distinguish between RequestType and Direction because hall calls are never IDLE — using Direction would require runtime validation that the type system should prevent. Request is a frozen dataclass so 
+  it's hashable and safe in a set, which gives O(1) deduplication.                                                                                                                                              
+  
+  ▎ step() has five cases in order: empty → go IDLE; IDLE with requests → pick direction deterministically; at a stop → remove and don't move this tick; no requests ahead → reverse and don't move this tick;  
+  otherwise → move. The order matters: you must pick direction before checking for stops, and you must check for stops before reversing.
+                                                                                                                                                                                                                
+  ▎ _has_requests_ahead checks ALL request types regardless of direction — the elevator travels toward everything but only stops for matching types. An elevator going UP passes a PICKUP_DOWN floor and serves 
+  it on the return trip. This is correct SCAN behavior, not a bug.
+                                                                                                                                                                                                                
+  ▎ The controller's lock serializes select + add atomically — without it, two concurrent hall calls could both pick the same elevator as 'best' and create race conditions on the set."                        
+  
+✻ Brewed for 1m 57s  
