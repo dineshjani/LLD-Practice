@@ -1,0 +1,421 @@
+⏺ Parking Lot — Complete Python Implementation
+
+  ---                                                                                                                                                                                                           
+  Step 1: Enums — Two Separate, Same Values
+                                                                                                                                                                                                                
+  from enum import Enum
+  from dataclasses import dataclass                                                                                                                                                                             
+  from typing import Dict, List, Optional, Set
+  import uuid                                                                                                                                                                                                   
+  import time
+  import math                                                                                                                                                                                                   
+  import threading                                                                                                                                                                                              
+  
+  class VehicleType(Enum):                                                                                                                                                                                      
+      MOTORCYCLE = "motorcycle"
+      CAR = "car"                                                                                                                                                                                               
+      LARGE = "large"
+                                                                                                                                                                                                                
+  class SpotType(Enum):
+      MOTORCYCLE = "motorcycle"
+      CAR = "car"
+      LARGE = "large"                                                                                                                                                                                           
+   
+  Why two enums with identical values?                                                                                                                                                                          
+                  
+  Right now VehicleType.CAR == SpotType.CAR is False in Python — they're different enum types. This matters when requirements change: "motorcycles can park in car spots if motorcycle spots are full." With one
+   shared enum you'd be checking if spot_type == vehicle_type which breaks the moment the mapping isn't 1:1. Separate enums keep the concepts distinct.
+                                                                                                                                                                                                                
+  ---             
+  Step 2: ParkingSpot — Pure Data Holder
+
+  @dataclass
+  class ParkingSpot:
+      spot_id: str
+      spot_type: SpotType
+                                                                                                                                                                                                                
+  That's it. No is_occupied flag. No reference to a ticket.                                                                                                                                                     
+                                                                                                                                                                                                                
+  Why no is_occupied on ParkingSpot?                                                                                                                                                                            
+                  
+  Occupancy is relational state — it's a relationship between a ticket and a spot, managed by ParkingLot. The spot itself is just a physical description: "I am a CAR spot with ID B2." Whether it's currently  
+  taken is the orchestrator's concern, tracked via _occupied_spot_ids. This mirrors what the article explains about intrinsic vs relational state.
+                                                                                                                                                                                                                
+  ---             
+  Step 3: Ticket — Immutable Record
+                                                                                                                                                                                                                
+  @dataclass(frozen=True)
+  class Ticket:                                                                                                                                                                                                 
+      ticket_id: str
+      spot_id: str
+      vehicle_type: VehicleType
+      entry_time_ms: int      # Unix ms — integer, exact arithmetic
+                                                                                                                                                                                                                
+  Why frozen=True?
+                                                                                                                                                                                                                
+  A ticket is a receipt. Once issued at entry, nothing about it should change. frozen=True makes it truly immutable — any attempt to reassign a field raises FrozenInstanceError. This also gives free __hash__ 
+  so you can use tickets as dict keys or set members if needed.
+                                                                                                                                                                                                                
+  Why entry_time_ms as int, not datetime?                                                                                                                                                                       
+   
+  Fee calculation is arithmetic: exit_ms - entry_ms. Integers make this exact. datetime subtraction returns timedelta, which is fine, but requires conversion. Storing milliseconds keeps the math transparent  
+  and testable — you can pass entry_time_ms=0 and exit_time_ms=9000000 in tests without mocking datetime.now().
+                                                                                                                                                                                                                
+  ---             
+  Step 4: ParkingLot — The Orchestrator
+
+  class ParkingLot:
+      def __init__(self, spots: List[ParkingSpot], hourly_rate_cents: int):
+          self._spots = spots                                                                                                                                                                                   
+          self._hourly_rate_cents = hourly_rate_cents
+                                                                                                                                                                                                                
+          # --- Mutable state ---
+          self._occupied_spot_ids: Set[str] = set()                                                                                                                                                             
+          self._active_tickets: Dict[str, Ticket] = {}    # ticket_id → Ticket                                                                                                                                  
+          self._lock = threading.Lock()                   # for concurrent entrances
+                                                                                                                                                                                                                
+  Why _active_tickets as a dict, not a list?
+                                                                                                                                                                                                                
+  During exit() we receive a ticket_id string and need to validate it. With a list: O(n) scan through every active ticket. With a dict: O(1) hash lookup. At parking lot scale (200 cars) this is 1.8           
+  microseconds difference — performance is irrelevant — but the dict makes the intent explicit: "look up by ID." That clarity is the real reason.
+                                                                                                                                                                                                                
+  Why _occupied_spot_ids as a set?
+
+  Inside _find_available_spot we check every spot: spot.spot_id not in self._occupied_spot_ids. If this were a list, that check is O(n) per spot × O(n) spots = O(n²). With a set it's O(1) per spot × O(n)     
+  spots = O(n). For a 1000-spot garage, that's the difference between 1,000,000 and 1,000 operations per entry.
+                                                                                                                                                                                                                
+  ---             
+  Step 5: The enter Method
+                                                                                                                                                                                                                
+      def enter(self, vehicle_type: VehicleType) -> Ticket:
+          with self._lock:                                                                                                                                                                                      
+              # Step 1: Find a compatible, unoccupied spot
+              spot = self._find_available_spot(vehicle_type)                                                                                                                                                    
+              if spot is None:                                                                                                                                                                                  
+                  raise ValueError(f"No available spots for {vehicle_type.value}")                                                                                                                              
+                                                                                                                                                                                                                
+              # Step 2: Mark spot occupied BEFORE creating ticket                                                                                                                                               
+              # (within the lock — no other thread can steal this spot)
+              self._occupied_spot_ids.add(spot.spot_id)                                                                                                                                                         
+                  
+              # Step 3: Create immutable ticket                                                                                                                                                                 
+              ticket = Ticket(
+                  ticket_id=str(uuid.uuid4()),
+                  spot_id=spot.spot_id,                                                                                                                                                                         
+                  vehicle_type=vehicle_type,
+                  entry_time_ms=int(time.time() * 1000),                                                                                                                                                        
+              )   
+
+              # Step 4: Store and return                                                                                                                                                                        
+              self._active_tickets[ticket.ticket_id] = ticket
+              return ticket                                                                                                                                                                                     
+                  
+  Why lock the entire enter?                                                                                                                                                                                    
+  
+  The race condition lives between "check if spot is available" and "mark it occupied." Thread A sees spot B2 available → Thread B sees spot B2 available → both add "B2" to _occupied_spot_ids → both get      
+  tickets for B2 → two cars, one spot. The lock serializes this entire check-and-assign atomically.
+                                                                                                                                                                                                                
+  Why mark the spot occupied before creating the ticket?
+
+  If ticket creation could fail (though it can't here), you want to fail clean. The general rule: claim the resource first, create the record second. This way you never have a ticket pointing to an available 
+  spot.
+                                                                                                                                                                                                                
+  ---             
+  Step 6: The exit Method
+
+      def exit(self, ticket_id: str) -> int:
+          if not ticket_id:                                                                                                                                                                                     
+              raise ValueError("Ticket ID cannot be empty")
+                                                                                                                                                                                                                
+          with self._lock:                                                                                                                                                                                      
+              # Step 1: Validate ticket exists
+              ticket = self._active_tickets.get(ticket_id)                                                                                                                                                      
+              if ticket is None:
+                  raise ValueError("Ticket not found or already used")
+                                                                                                                                                                                                                
+              # Step 2: Calculate fee BEFORE removing state
+              exit_time_ms = int(time.time() * 1000)                                                                                                                                                            
+              fee_cents = self._compute_fee(ticket.entry_time_ms, exit_time_ms)                                                                                                                                 
+                                                                                                                                                                                                                
+              # Step 3: Free the spot (remove from set → spot is available again)                                                                                                                               
+              self._occupied_spot_ids.discard(ticket.spot_id)                                                                                                                                                   
+                                                                                                                                                                                                                
+              # Step 4: Invalidate ticket (prevents double exit)                                                                                                                                                
+              del self._active_tickets[ticket_id]                                                                                                                                                               
+                                                                                                                                                                                                                
+              return fee_cents
+
+  Why discard instead of remove?
+
+  set.remove(x) raises KeyError if x is missing. set.discard(x) silently does nothing. Since we just validated the ticket exists and it points to a spot_id, remove would work — but discard is defensive. If   
+  somehow state got corrupted, we still free gracefully.
+                                                                                                                                                                                                                
+  Why delete the ticket at exit?
+
+  The ticket removal is what prevents double-exit. After del self._active_tickets[ticket_id], the next call to exit(ticket_id) hits get() → returns None → raises "already used." No separate "used tickets" set
+   needed.
+                                                                                                                                                                                                                
+  ---             
+  Step 7: Helper Methods
+
+      def _find_available_spot(self, vehicle_type: VehicleType) -> Optional[ParkingSpot]:
+          required_type = self._map_vehicle_to_spot_type(vehicle_type)                                                                                                                                          
+          for spot in self._spots:                                                                                                                                                                              
+              if (spot.spot_type == required_type                                                                                                                                                               
+                      and spot.spot_id not in self._occupied_spot_ids):                                                                                                                                         
+                  return spot                                                                                                                                                                                   
+          return None
+                                                                                                                                                                                                                
+      def _map_vehicle_to_spot_type(self, vehicle_type: VehicleType) -> SpotType:
+          mapping = {
+              VehicleType.MOTORCYCLE: SpotType.MOTORCYCLE,
+              VehicleType.CAR: SpotType.CAR,                                                                                                                                                                    
+              VehicleType.LARGE: SpotType.LARGE,
+          }                                                                                                                                                                                                     
+          result = mapping.get(vehicle_type)
+          if result is None:                                                                                                                                                                                    
+              raise ValueError(f"Unknown vehicle type: {vehicle_type}")
+          return result                                                                                                                                                                                         
+                  
+      def _compute_fee(self, entry_time_ms: int, exit_time_ms: int) -> int:                                                                                                                                     
+          duration_ms = exit_time_ms - entry_time_ms
+          ms_per_hour = 1000 * 60 * 60                                                                                                                                                                          
+                                                                                                                                                                                                                
+          # math.ceil handles rounding up: 5 min → 1 hour, 61 min → 2 hours                                                                                                                                     
+          hours = math.ceil(duration_ms / ms_per_hour)                                                                                                                                                          
+          hours = max(hours, 1)   # minimum 1 hour even if duration_ms == 0                                                                                                                                     
+                                                                                                                                                                                                                
+          return hours * self._hourly_rate_cents                                                                                                                                                                
+                                                                                                                                                                                                                
+  Why math.ceil instead of the manual // + remainder check?                                                                                                                                                     
+   
+  The article's pseudocode does:                                                                                                                                                                                
+  hours = duration_ms // ms_per_hour
+  if duration_ms % ms_per_hour > 0:                                                                                                                                                                             
+      hours += 1                   
+  math.ceil(x / y) does exactly the same thing in one line. ceil(2.5) = 3, ceil(3.0) = 3. Cleaner, harder to get wrong.                                                                                         
+                  
+  Why max(hours, 1)?                                                                                                                                                                                            
+   
+  If a vehicle enters and exits within milliseconds (test scenario, gate malfunction), ceil(0 / ms_per_hour) = ceil(0) = 0. Charging 0 is probably wrong. Minimum 1 hour charge is the safe default.            
+                  
+  Why a dict for the mapping instead of if-elif?                                                                                                                                                                
+                  
+  Dict lookup is O(1) and exhaustive — if you add a new VehicleType.ELECTRIC enum value, the mapping.get() returns None and you get a clear ValueError. With if-elif chains, you might forget to add the new    
+  branch and it silently returns None from the function body.
+                                                                                                                                                                                                                
+  ---             
+  Step 8: Full Walkthrough — Real Numbers
+                                                                                                                                                                                                                
+  # ─── Setup ───────────────────────────────────────────────────────────────────
+  spots = [                                                                                                                                                                                                     
+      ParkingSpot("M1", SpotType.MOTORCYCLE),
+      ParkingSpot("M2", SpotType.MOTORCYCLE),                                                                                                                                                                   
+      ParkingSpot("C1", SpotType.CAR),                                                                                                                                                                          
+      ParkingSpot("C2", SpotType.CAR),
+      ParkingSpot("L1", SpotType.LARGE),                                                                                                                                                                        
+  ]                                                                                                                                                                                                             
+   
+  lot = ParkingLot(spots=spots, hourly_rate_cents=500)   # $5.00/hour                                                                                                                                           
+                  
+  # ─── Entry ───────────────────────────────────────────────────────────────────                                                                                                                               
+  ticket = lot.enter(VehicleType.CAR)
+  print(f"Spot assigned: {ticket.spot_id}")       # C1 (first car spot found)                                                                                                                                   
+  print(f"Ticket ID: {ticket.ticket_id}")         # UUID string                                                                                                                                                 
+  print(f"Occupied now: {lot._occupied_spot_ids}")  # {"C1"}                                                                                                                                                    
+                                                                                                                                                                                                                
+  # Try to enter when only one car spot left                                                                                                                                                                    
+  ticket2 = lot.enter(VehicleType.CAR)
+  print(f"Spot: {ticket2.spot_id}")   # C2                                                                                                                                                                      
+                                                                                                                                                                                                                
+  # ─── Exit after 2.5 hours ────────────────────────────────────────────────────                                                                                                                               
+  # Simulate: override entry_time to 2.5 hours ago                                                                                                                                                              
+  fake_entry_ms = int(time.time() * 1000) - int(2.5 * 3600 * 1000)                                                                                                                                              
+  test_ticket = Ticket(                                                                                                                                                                                         
+      ticket_id=ticket.ticket_id,                                                                                                                                                                               
+      spot_id=ticket.spot_id,                                                                                                                                                                                   
+      vehicle_type=ticket.vehicle_type,
+      entry_time_ms=fake_entry_ms,                                                                                                                                                                              
+  )
+  lot._active_tickets[ticket.ticket_id] = test_ticket   # inject for test                                                                                                                                       
+                                                                                                                                                                                                                
+  fee = lot.exit(ticket.ticket_id)
+  print(f"Fee: {fee} cents = ${fee/100:.2f}")     # 1500 cents = $15.00                                                                                                                                         
+  # 2.5 hours → ceil → 3 hours × 500 = 1500 cents ✓                                                                                                                                                             
+                                                                                                                                                                                                                
+  print(f"Occupied after exit: {lot._occupied_spot_ids}")  # {"C2"} — C1 is free                                                                                                                                
+                                                                                                                                                                                                                
+  # ─── Double exit (same ticket) ───────────────────────────────────────────────                                                                                                                               
+  try:            
+      lot.exit(ticket.ticket_id)                                                                                                                                                                                
+  except ValueError as e:
+      print(e)    # "Ticket not found or already used"                                                                                                                                                          
+                  
+  # ─── Lot full for cars ───────────────────────────────────────────────────────                                                                                                                               
+  # Both C1 (freed) and C2 (still held by ticket2) — C1 is available
+  ticket3 = lot.enter(VehicleType.CAR)                                                                                                                                                                          
+  print(f"Got C1 again: {ticket3.spot_id}")   # C1
+                                                                                                                                                                                                                
+  try:            
+      lot.enter(VehicleType.CAR)   # now both C1 and C2 occupied                                                                                                                                                
+  except ValueError as e:                                                                                                                                                                                       
+      print(e)    # "No available spots for car"
+                                                                                                                                                                                                                
+  ---             
+  Step 9: Thread Safety Stress Test
+                                                                                                                                                                                                                
+  import threading
+                                                                                                                                                                                                                
+  lot2 = ParkingLot(
+      spots=[ParkingSpot("C1", SpotType.CAR), ParkingSpot("C2", SpotType.CAR)],
+      hourly_rate_cents=500,                                                                                                                                                                                    
+  )
+                                                                                                                                                                                                                
+  results = []                                                                                                                                                                                                  
+  errors = []
+  barrier = threading.Barrier(5)   # 5 cars, 2 spots — 3 must fail                                                                                                                                              
+                                                                                                                                                                                                                
+  def try_enter(car_id):                                                                                                                                                                                        
+      barrier.wait()   # all threads start simultaneously                                                                                                                                                       
+      try:                                                                                                                                                                                                      
+          t = lot2.enter(VehicleType.CAR)
+          results.append((car_id, t.spot_id))                                                                                                                                                                   
+      except ValueError as e:
+          errors.append((car_id, str(e)))                                                                                                                                                                       
+                  
+  threads = [threading.Thread(target=try_enter, args=(i,)) for i in range(5)]                                                                                                                                   
+  for t in threads: t.start()
+  for t in threads: t.join()                                                                                                                                                                                    
+                  
+  print(f"Successful bookings: {len(results)}")   # exactly 2                                                                                                                                                   
+  print(f"Rejected: {len(errors)}")               # exactly 3
+  print(f"Spots booked: {[r[1] for r in results]}")   # ["C1", "C2"] in some order                                                                                                                              
+                                                                                                                                                                                                                
+  Why threading.Barrier?                                                                                                                                                                                        
+  Without it, Thread 0 might finish completely before Thread 1 even starts — no race. The barrier holds all threads until all 5 have called barrier.wait(), then releases them simultaneously. This creates a   
+  genuine race on the 2 available spots.                                                                                                                                                                        
+  
+  ---                                                                                                                                                                                                           
+  Step 10: Extension — Multi-Floor Garage
+
+  class ParkingFloor:
+      def __init__(self, floor_number: int, spots: List[ParkingSpot]):
+          self.floor_number = floor_number                                                                                                                                                                      
+          self._spots = spots
+                                                                                                                                                                                                                
+      def find_available_spot(                                                                                                                                                                                  
+          self, spot_type: SpotType, occupied_ids: Set[str]
+      ) -> Optional[ParkingSpot]:                                                                                                                                                                               
+          for spot in self._spots:
+              if spot.spot_type == spot_type and spot.spot_id not in occupied_ids:                                                                                                                              
+                  return spot
+          return None                                                                                                                                                                                           
+                  
+      def available_count(self, spot_type: SpotType, occupied_ids: Set[str]) -> int:                                                                                                                            
+          return sum(
+              1 for s in self._spots                                                                                                                                                                            
+              if s.spot_type == spot_type and s.spot_id not in occupied_ids                                                                                                                                     
+          )
+                                                                                                                                                                                                                
+                                                                                                                                                                                                                
+  class MultiFloorParkingLot(ParkingLot):
+      """Extends ParkingLot with floor-aware allocation."""                                                                                                                                                     
+                  
+      def __init__(self, floors: List[ParkingFloor], hourly_rate_cents: int):                                                                                                                                   
+          all_spots = [spot for floor in floors for spot in floor._spots]
+          super().__init__(all_spots, hourly_rate_cents)                                                                                                                                                        
+          self._floors = floors                                                                                                                                                                                 
+  
+      def _find_available_spot(self, vehicle_type: VehicleType) -> Optional[ParkingSpot]:                                                                                                                       
+          required_type = self._map_vehicle_to_spot_type(vehicle_type)
+          # Strategy: fill lower floors first (simplest)                                                                                                                                                        
+          for floor in self._floors:                                                                                                                                                                            
+              spot = floor.find_available_spot(required_type, self._occupied_spot_ids)                                                                                                                          
+              if spot:                                                                                                                                                                                          
+                  return spot
+          return None
+
+      # Balanced strategy: pick floor with most availability                                                                                                                                                    
+      def _find_balanced(self, vehicle_type: VehicleType) -> Optional[ParkingSpot]:
+          required_type = self._map_vehicle_to_spot_type(vehicle_type)                                                                                                                                          
+          best_floor = max(
+              self._floors,                                                                                                                                                                                     
+              key=lambda f: f.available_count(required_type, self._occupied_spot_ids),
+              default=None,                                                                                                                                                                                     
+          )                                                                                                                                                                                                     
+          if best_floor and best_floor.available_count(required_type, self._occupied_spot_ids) > 0:
+              return best_floor.find_available_spot(required_type, self._occupied_spot_ids)                                                                                                                     
+          return None                                                                                                                                                                                           
+  
+  Spot IDs encode the floor: "3-C5" means floor 3, car spot 5. Ticket never changes — it still stores spot_id. Exit flow is identical.                                                                          
+                  
+  ---                                                                                                                                                                                                           
+  Step 11: Extension — Per-Vehicle-Type Pricing
+
+  class FlexPricingParkingLot(ParkingLot):
+      def __init__(self, spots: List[ParkingSpot], rates: Dict[VehicleType, int]):                                                                                                                              
+          super().__init__(spots, hourly_rate_cents=0)   # base not used                                                                                                                                        
+          self._rates = rates     # {VehicleType.MOTORCYCLE: 300, VehicleType.CAR: 500, ...}                                                                                                                    
+                                                                                                                                                                                                                
+      def _compute_fee(self, entry_time_ms: int, exit_time_ms: int) -> int:                                                                                                                                     
+          # Override is called with vehicle_type from the ticket                                                                                                                                                
+          raise NotImplementedError("Use _compute_fee_for_vehicle instead")                                                                                                                                     
+                                                                                                                                                                                                                
+      def exit(self, ticket_id: str) -> int:                                                                                                                                                                    
+          if not ticket_id:                                                                                                                                                                                     
+              raise ValueError("Ticket ID cannot be empty")
+          with self._lock:                                                                                                                                                                                      
+              ticket = self._active_tickets.get(ticket_id)
+              if ticket is None:                                                                                                                                                                                
+                  raise ValueError("Ticket not found or already used")
+                                                                                                                                                                                                                
+              exit_time_ms = int(time.time() * 1000)
+              hours = max(math.ceil((exit_time_ms - ticket.entry_time_ms) / (1000 * 60 * 60)), 1)                                                                                                               
+              rate = self._rates.get(ticket.vehicle_type, 500)                                                                                                                                                  
+              fee_cents = hours * rate                                                                                                                                                                          
+                                                                                                                                                                                                                
+              self._occupied_spot_ids.discard(ticket.spot_id)                                                                                                                                                   
+              del self._active_tickets[ticket_id]
+              return fee_cents                                                                                                                                                                                  
+   
+  # Usage:                                                                                                                                                                                                      
+  flex_lot = FlexPricingParkingLot(
+      spots=spots,
+      rates={
+          VehicleType.MOTORCYCLE: 300,    # $3/hr
+          VehicleType.CAR: 500,           # $5/hr                                                                                                                                                               
+          VehicleType.LARGE: 800,         # $8/hr
+      }                                                                                                                                                                                                         
+  )               
+                                                                                                                                                                                                                
+  ---             
+  Design Patterns Summary
+                         
+  ┌───────────────────────┬─────────────────────────────────────────┬───────────────────────────────────────────────────────────────┐
+  │        Pattern        │                  Where                  │                              Why                              │                                                                           
+  ├───────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Facade                │ ParkingLot                              │ Two-method public API — hides all internal state              │                                                                           
+  ├───────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Value Object          │ Ticket (frozen dataclass)               │ Immutable receipt, equality by value                          │                                                                           
+  ├───────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤                                                                           
+  │ Index / Set           │ _occupied_spot_ids                      │ O(1) availability check per spot                              │                                                                           
+  ├───────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤                                                                           
+  │ Strategy (extendable) │ _find_available_spot override           │ Swap fill-first vs balanced allocation without changing enter │
+  ├───────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤                                                                           
+  │ Template Method       │ MultiFloorParkingLot extends ParkingLot │ Reuse enter/exit flow, override only spot-finding             │
+  ├───────────────────────┼─────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤                                                                           
+  │ Separate Enums        │ VehicleType + SpotType                  │ Future flexibility when mapping is no longer 1:1              │
+  └───────────────────────┴─────────────────────────────────────────┴───────────────────────────────────────────────────────────────┘                                                                           
+                  
+  ---                                                                                                                                                                                                           
+  Key Points to Say in Interview
+                                                                                                                                                                                                                
+  ▎ "I track occupancy as a Set[str] of spot IDs in ParkingLot, not as a flag on ParkingSpot. Occupancy is relational state — a ticket-to-spot assignment managed by the orchestrator — not an intrinsic 
+  property of the spot itself. The set gives O(1) lookup in _find_available_spot.                                                                                                                               
+  
+  ▎ For concurrency, I lock the entire enter method. The race window is between find_available_spot and _occupied_spot_ids.add — if two threads interleave there, both get the same spot. The lock makes        
+  check-and-assign atomic. For a 3-5 entrance lot, serializing enter is correct and the throughput is fine.
+                                                                                                                                                                                                                
+  ▎ exit also locks: it reads the ticket, computes the fee, frees the spot, and deletes the ticket atomically. Deleting the ticket is what prevents double-exit — the second call finds get() returning None.   
+  
+  ▎ Ticket is frozen because it's a receipt — immutable by definition. _compute_fee uses math.ceil for the round-up rule, with a minimum of 1 hour."  
