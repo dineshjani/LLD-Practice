@@ -1,0 +1,515 @@
+⏺ Movie Ticket Booking — Complete Python Implementation
+
+  ---
+  Step 1: Core Value Objects (Frozen Dataclasses)
+
+  from dataclasses import dataclass, field
+  from enum import Enum
+  from typing import Dict, List, Optional, Set
+  from datetime import datetime, timedelta
+  import threading
+  import uuid
+  import time
+
+  Why frozen dataclasses? These are immutable facts — a Movie's title never changes mid-session. frozen=True gives you free __hash__ so you can put them in sets/dicts, and prevents accidental mutation.
+
+  @dataclass(frozen=True)
+  class Movie:
+      id: str
+      title: str
+      duration_minutes: int
+      genre: str
+
+  @dataclass(frozen=True)
+  class Seat:
+      row: str        # "A", "B", "C"
+      number: int     # 1, 2, 3 ...
+      seat_type: str  # "STANDARD", "PREMIUM", "HANDICAP"
+
+      def label(self) -> str:
+          return f"{self.row}{self.number}"   # "A1", "B12"
+
+  Why seat_type on Seat (not Showtime)? The physical seat doesn't change — A1 is always premium if the theater built it that way. Pricing can differ per showtime, but the seat type is structural.
+
+  ---
+  Step 2: SeatStatus Enum + Hold Logic
+
+  class SeatStatus(Enum):
+      AVAILABLE = "available"
+      HELD = "held"           # temporary lock (10 min timer)
+      BOOKED = "booked"       # payment confirmed
+      BLOCKED = "blocked"     # maintenance / broken seat
+
+  Why HELD separate from BOOKED?
+  - User clicks "Select Seat A1" → status = HELD (15 min to pay)
+  - User pays → status = BOOKED
+  - User abandons → timer expires → status = AVAILABLE again
+  - Without HELD, two users could both "book" A1 simultaneously
+
+  @dataclass
+  class SeatHold:
+      seat: Seat
+      user_id: str
+      held_until: datetime    # hold expires at this time
+      hold_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+  ---
+  Step 3: Reservation (Confirmation)
+
+  @dataclass
+  class Reservation:
+      confirmation_id: str
+      showtime_id: str
+      user_id: str
+      seats: List[Seat]
+      total_price: float
+      booked_at: datetime
+      status: str = "CONFIRMED"   # "CONFIRMED" | "CANCELLED"
+
+      def receipt(self) -> str:
+          seat_labels = ", ".join(s.label() for s in self.seats)
+          return (
+              f"Booking {self.confirmation_id}\n"
+              f"Seats: {seat_labels}\n"
+              f"Total: ${self.total_price:.2f}\n"
+              f"Status: {self.status}"
+          )
+
+  ---
+  Step 4: Showtime — The Hardest Class (Concurrency Lives Here)
+
+  This is where the interview question lives. Every seat operation must be atomic — no two threads can touch the same showtime simultaneously.
+
+  class Showtime:
+      def __init__(
+          self,
+          showtime_id: str,
+          movie: Movie,
+          theater_id: str,
+          start_time: datetime,
+          seats: List[Seat],
+          price_map: Dict[str, float],    # {"STANDARD": 12.0, "PREMIUM": 18.0}
+          hold_duration_minutes: int = 10,
+      ):
+          self.showtime_id = showtime_id
+          self.movie = movie
+          self.theater_id = theater_id
+          self.start_time = start_time
+          self.hold_duration_minutes = hold_duration_minutes
+          self.price_map = price_map
+
+          # --- Mutable state protected by lock ---
+          self._lock = threading.Lock()
+          self._seat_status: Dict[str, SeatStatus] = {
+              s.label(): SeatStatus.AVAILABLE for s in seats
+          }
+          self._seats: Dict[str, Seat] = {s.label(): s for s in seats}
+          self._holds: Dict[str, SeatHold] = {}         # hold_id → SeatHold
+          self._seat_hold_map: Dict[str, str] = {}      # seat_label → hold_id
+          self._reservations: Dict[str, Reservation] = {} # confirmation_id → Reservation
+
+  Why one lock per Showtime?
+  - If you use one global lock, booking Showtime-101 blocks all threads trying to book Showtime-202 — terrible for a high-traffic system.
+  - Per-showtime lock: Thread A books show 101, Thread B books show 202 simultaneously. No contention.
+
+  ---
+  Step 5: Hold Seat (Click "Select")
+
+      def hold_seats(self, seat_labels: List[str], user_id: str) -> Optional[SeatHold]:
+          """
+          Atomically try to place a temporary hold on all requested seats.
+          Returns SeatHold on success, None if any seat is unavailable.
+          """
+          with self._lock:
+              # Step 1: Expire stale holds before checking availability
+              self._expire_holds()
+
+              # Step 2: Check ALL seats are available (all-or-nothing)
+              for label in seat_labels:
+                  if label not in self._seats:
+                      return None  # seat doesn't exist
+                  if self._seat_status[label] != SeatStatus.AVAILABLE:
+                      return None  # seat already held/booked
+
+              # Step 3: Place hold on all seats atomically
+              held_until = datetime.now() + timedelta(minutes=self.hold_duration_minutes)
+
+              # We store one hold per seat for simplicity
+              # In production you'd batch them under one hold_id per user request
+              hold_id = str(uuid.uuid4())
+
+              for label in seat_labels:
+                  seat = self._seats[label]
+                  hold = SeatHold(
+                      seat=seat,
+                      user_id=user_id,
+                      held_until=held_until,
+                      hold_id=f"{hold_id}_{label}",
+                  )
+                  self._holds[hold.hold_id] = hold
+                  self._seat_hold_map[label] = hold.hold_id
+                  self._seat_status[label] = SeatStatus.HELD
+
+              # Return the first hold as the "session hold" reference
+              first_hold = list(self._holds.values())[-len(seat_labels)]
+              return first_hold
+
+      def _expire_holds(self):
+          """Called inside lock — remove holds whose timer expired."""
+          now = datetime.now()
+          expired_hold_ids = [
+              hold_id for hold_id, hold in self._holds.items()
+              if hold.held_until < now
+          ]
+          for hold_id in expired_hold_ids:
+              hold = self._holds.pop(hold_id)
+              label = hold.seat.label()
+              # Only release if the seat is still mapped to this hold
+              if self._seat_hold_map.get(label) == hold_id:
+                  del self._seat_hold_map[label]
+                  self._seat_status[label] = SeatStatus.AVAILABLE
+
+  Why _expire_holds() called inside the lock?
+  Because _seat_status is shared mutable state. If you expire outside the lock, another thread might read HELD for a seat that should be AVAILABLE.
+
+  ---
+  Step 6: Book Seats (Payment Confirmed)
+
+      def book_seats(
+          self,
+          seat_labels: List[str],
+          user_id: str,
+          hold_ids: Optional[List[str]] = None,
+      ) -> Optional[Reservation]:
+          """
+          Confirm booking. Seats must be HELD by this user (or AVAILABLE for direct booking).
+          Returns Reservation on success, None on failure.
+          """
+          with self._lock:
+              self._expire_holds()
+
+              # Validate all seats
+              for label in seat_labels:
+                  if label not in self._seats:
+                      return None
+                  status = self._seat_status[label]
+
+                  if status == SeatStatus.HELD:
+                      # Verify the hold belongs to this user
+                      hold_id = self._seat_hold_map.get(label)
+                      hold = self._holds.get(hold_id)
+                      if not hold or hold.user_id != user_id:
+                          return None  # held by someone else
+                  elif status != SeatStatus.AVAILABLE:
+                      return None  # BOOKED or BLOCKED
+
+              # Calculate price
+              total = sum(
+                  self.price_map.get(self._seats[label].seat_type, 12.0)
+                  for label in seat_labels
+              )
+
+              # Confirm booking
+              seats = [self._seats[label] for label in seat_labels]
+              confirmation_id = str(uuid.uuid4())[:8].upper()
+              reservation = Reservation(
+                  confirmation_id=confirmation_id,
+                  showtime_id=self.showtime_id,
+                  user_id=user_id,
+                  seats=seats,
+                  total_price=total,
+                  booked_at=datetime.now(),
+              )
+
+              # Update state
+              for label in seat_labels:
+                  hold_id = self._seat_hold_map.pop(label, None)
+                  if hold_id:
+                      self._holds.pop(hold_id, None)
+                  self._seat_status[label] = SeatStatus.BOOKED
+
+              self._reservations[confirmation_id] = reservation
+              return reservation
+
+  ---
+  Step 7: Cancel Reservation
+
+      def cancel(self, confirmation_id: str, user_id: str) -> bool:
+          """
+          Cancel a confirmed reservation. Releases seats back to AVAILABLE.
+          Returns True if cancelled, False if not found / not owner.
+          """
+          with self._lock:
+              reservation = self._reservations.get(confirmation_id)
+              if not reservation:
+                  return False
+              if reservation.user_id != user_id:
+                  return False    # can't cancel someone else's booking
+              if reservation.status == "CANCELLED":
+                  return False    # already cancelled
+
+              reservation.status = "CANCELLED"
+              for seat in reservation.seats:
+                  self._seat_status[seat.label()] = SeatStatus.AVAILABLE
+              return True
+
+      def available_seats(self) -> List[Seat]:
+          """Snapshot of available seats (safe read with lock)."""
+          with self._lock:
+              self._expire_holds()
+              return [
+                  self._seats[label]
+                  for label, status in self._seat_status.items()
+                  if status == SeatStatus.AVAILABLE
+              ]
+
+  ---
+  Step 8: Theater
+
+  @dataclass
+  class Theater:
+      theater_id: str
+      name: str
+      location: str
+      screens: int        # number of screens/halls
+
+      def __hash__(self):
+          return hash(self.theater_id)
+
+  Why not put seats on Theater? Each screen in a theater has different seats. Seats belong to a Showtime (which maps to a specific screen at a specific time), not to the theater building itself.
+
+  ---
+  Step 9: BookingSystem — The Orchestrator
+
+  class BookingSystem:
+      """
+      Top-level facade. Holds indexes for fast lookup.
+      Thread-safe: each Showtime has its own lock; BookingSystem
+      only needs a lock for its own index mutations.
+      """
+
+      def __init__(self):
+          self._lock = threading.Lock()
+          self._movies: Dict[str, Movie] = {}             # movie_id → Movie
+          self._theaters: Dict[str, Theater] = {}         # theater_id → Theater
+          self._showtimes: Dict[str, Showtime] = {}       # showtime_id → Showtime
+
+          # Indexes for fast search
+          self._movie_title_index: Dict[str, List[str]] = {}      # title_lower → [movie_id]
+          self._theater_showtimes: Dict[str, List[str]] = {}      # theater_id → [showtime_id]
+          self._movie_showtimes: Dict[str, List[str]] = {}        # movie_id → [showtime_id]
+          self._user_reservations: Dict[str, List[str]] = {}      # user_id → [confirmation_id+showtime_id]
+
+  Why build indexes?
+  - search_movies("Avatar") → without index: scan all movies O(n). With title index: O(1) hash lookup.
+  - get_showtimes_for_movie(movie_id) → without index: scan all showtimes. With index: O(1).
+
+      # --- Admin: Add content ---
+
+      def add_movie(self, movie: Movie):
+          with self._lock:
+              self._movies[movie.id] = movie
+              key = movie.title.lower()
+              self._movie_title_index.setdefault(key, []).append(movie.id)
+              self._movie_showtimes.setdefault(movie.id, [])
+
+      def add_theater(self, theater: Theater):
+          with self._lock:
+              self._theaters[theater.theater_id] = theater
+              self._theater_showtimes.setdefault(theater.theater_id, [])
+
+      def add_showtime(self, showtime: Showtime):
+          with self._lock:
+              self._showtimes[showtime.showtime_id] = showtime
+              self._theater_showtimes.setdefault(showtime.theater_id, []).append(showtime.showtime_id)
+              self._movie_showtimes.setdefault(showtime.movie.id, []).append(showtime.showtime_id)
+
+      # --- User-facing: Search ---
+
+      def search_movies(self, title: str) -> List[Movie]:
+          """Case-insensitive title search."""
+          key = title.lower()
+          with self._lock:
+              ids = self._movie_title_index.get(key, [])
+              return [self._movies[mid] for mid in ids if mid in self._movies]
+
+      def get_showtimes_for_movie(
+          self,
+          movie_id: str,
+          date: Optional[datetime] = None,
+      ) -> List[Showtime]:
+          with self._lock:
+              ids = self._movie_showtimes.get(movie_id, [])
+              shows = [self._showtimes[sid] for sid in ids if sid in self._showtimes]
+
+          if date:
+              shows = [
+                  s for s in shows
+                  if s.start_time.date() == date.date()
+              ]
+          return shows
+
+      def get_showtimes_at_theater(self, theater_id: str) -> List[Showtime]:
+          with self._lock:
+              ids = self._theater_showtimes.get(theater_id, [])
+              return [self._showtimes[sid] for sid in ids if sid in self._showtimes]
+
+      # --- User-facing: Booking flow ---
+
+      def hold_seats(
+          self, showtime_id: str, seat_labels: List[str], user_id: str
+      ) -> Optional[SeatHold]:
+          showtime = self._showtimes.get(showtime_id)
+          if not showtime:
+              return None
+          return showtime.hold_seats(seat_labels, user_id)
+
+      def book_seats(
+          self,
+          showtime_id: str,
+          seat_labels: List[str],
+          user_id: str,
+      ) -> Optional[Reservation]:
+          showtime = self._showtimes.get(showtime_id)
+          if not showtime:
+              return None
+          reservation = showtime.book_seats(seat_labels, user_id)
+          if reservation:
+              with self._lock:
+                  self._user_reservations.setdefault(user_id, []).append(
+                      f"{showtime_id}::{reservation.confirmation_id}"
+                  )
+          return reservation
+
+      def cancel_reservation(
+          self, showtime_id: str, confirmation_id: str, user_id: str
+      ) -> bool:
+          showtime = self._showtimes.get(showtime_id)
+          if not showtime:
+              return False
+          return showtime.cancel(confirmation_id, user_id)
+
+      def get_available_seats(self, showtime_id: str) -> List[Seat]:
+          showtime = self._showtimes.get(showtime_id)
+          if not showtime:
+              return []
+          return showtime.available_seats()
+
+  ---
+  Step 10: Full Walkthrough — Real Numbers
+
+  # ─── Setup ───────────────────────────────────────────────────────────────────
+  system = BookingSystem()                                                                                                                                                                                      
+   
+  # Add movie                                                                                                                                                                                                   
+  avatar = Movie(id="M1", title="Avatar", duration_minutes=162, genre="Sci-Fi")
+  system.add_movie(avatar)                                                                                                                                                                                      
+                                                                                                                                                                                                                
+  # Add theater
+  pvr = Theater(theater_id="T1", name="PVR Cinemas", location="Mumbai", screens=5)                                                                                                                              
+  system.add_theater(pvr)                                                                                                                                                                                       
+   
+  # Build seats: rows A-D, 5 seats each                                                                                                                                                                         
+  seats = [       
+      Seat(row=row, number=num, seat_type="PREMIUM" if row == "A" else "STANDARD")                                                                                                                              
+      for row in ["A", "B", "C", "D"]                                                                                                                                                                           
+      for num in range(1, 6)
+  ]                                                                                                                                                                                                             
+                  
+  # Add showtime                                                                                                                                                                                                
+  show = Showtime(
+      showtime_id="S1",
+      movie=avatar,
+      theater_id="T1",
+      start_time=datetime(2026, 3, 27, 19, 0),   # 7 PM                                                                                                                                                         
+      seats=seats,
+      price_map={"STANDARD": 250.0, "PREMIUM": 400.0},                                                                                                                                                          
+      hold_duration_minutes=10,
+  )                                                                                                                                                                                                             
+  system.add_showtime(show)
+
+  # ─── User books A1 + A2 ──────────────────────────────────────────────────────                                                                                                                               
+  print("Available:", len(system.get_available_seats("S1")))  # 20
+                                                                                                                                                                                                                
+  # Step 1: Hold seats (user selects on website)                                                                                                                                                                
+  hold = system.hold_seats("S1", ["A1", "A2"], user_id="U1")
+  print(f"Hold placed until: {hold.held_until}")  # 10 min from now                                                                                                                                             
+                                                                                                                                                                                                                
+  print("Available after hold:", len(system.get_available_seats("S1")))  # 18                                                                                                                                   
+                                                                                                                                                                                                                
+  # Step 2: Book (payment confirmed)                                                                                                                                                                            
+  reservation = system.book_seats("S1", ["A1", "A2"], user_id="U1")
+  print(reservation.receipt())
+  # Booking AB3F19C2                                                                                                                                                                                            
+  # Seats: A1, A2                                                                                                                                                                                               
+  # Total: $800.00   (2 × $400 PREMIUM)                                                                                                                                                                         
+  # Status: CONFIRMED                                                                                                                                                                                           
+                  
+  # ─── Another user tries to grab A1 (already booked) ─────────────────────────                                                                                                                                
+  hold2 = system.hold_seats("S1", ["A1", "B1"], user_id="U2")
+  print("U2 hold on A1+B1:", hold2)   # None — A1 is BOOKED                                                                                                                                                     
+                                                                                                                                                                                                                
+  hold3 = system.hold_seats("S1", ["B1", "B2"], user_id="U2")                                                                                                                                                   
+  print("U2 hold on B1+B2:", hold3)   # SeatHold object — success                                                                                                                                               
+                                                                                                                                                                                                                
+  # ─── Cancel U1's booking ─────────────────────────────────────────────────────                                                                                                                               
+  cancelled = system.cancel_reservation("S1", reservation.confirmation_id, user_id="U1")                                                                                                                        
+  print("Cancelled:", cancelled)      # True                                                                                                                                                                    
+  print("Available after cancel:", len(system.get_available_seats("S1")))  # 20 - 2 (B1,B2 held) = 18                                                                                                           
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                           
+  Step 11: Concurrent Stress Test                                                                                                                                                                               
+                  
+  import threading
+
+  # Two users racing for the same seats                                                                                                                                                                         
+  results = []
+  barrier = threading.Barrier(2)     # both threads start simultaneously                                                                                                                                        
+                                                                                                                                                                                                                
+  def user_books(user_id, seat_labels):
+      barrier.wait()                  # wait until both ready — true race                                                                                                                                       
+      r = system.book_seats("S1", seat_labels, user_id=user_id)                                                                                                                                                 
+      results.append((user_id, r))                                                                                                                                                                              
+                                                                                                                                                                                                                
+  # Reset state for clean test                                                                                                                                                                                  
+  show2 = Showtime("S2", avatar, "T1", datetime(2026, 3, 27, 21, 0), seats,
+                   {"STANDARD": 250.0, "PREMIUM": 400.0})                                                                                                                                                       
+  system.add_showtime(show2)
+                                                                                                                                                                                                                
+  t1 = threading.Thread(target=user_books, args=("U10", ["C1", "C2"]))                                                                                                                                          
+  t2 = threading.Thread(target=user_books, args=("U11", ["C1", "C3"]))  # both want C1!
+                                                                                                                                                                                                                
+  t1.start(); t2.start()
+  t1.join(); t2.join()                                                                                                                                                                                          
+                  
+  for user, res in results:                                                                                                                                                                                     
+      print(f"{user}: {'SUCCESS' if res else 'FAILED'}")
+  # Exactly one succeeds, one fails — the lock guarantees this.                                                                                                                                                 
+                                                                                                                                                                                                                
+  ---
+  Design Patterns Used                                                                                                                                                                                          
+                                                                                                                                                                                                                
+  ┌───────────────────────────┬────────────────────────────────────────┬────────────────────────────────────────────────────────────────────┐
+  │          Pattern          │                 Where                  │                                Why                                 │                                                                   
+  ├───────────────────────────┼────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Facade                    │ BookingSystem                          │ Single entry point — hides Showtime complexity from callers        │
+  ├───────────────────────────┼────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤
+  │ Index / Repository        │ _movie_title_index, _theater_showtimes │ O(1) lookup instead of O(n) scan                                   │                                                                   
+  ├───────────────────────────┼────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤                                                                   
+  │ Optimistic to Pessimistic │ threading.Lock per Showtime            │ Seat selection is high-contention → pessimistic locking is correct │                                                                   
+  ├───────────────────────────┼────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤                                                                   
+  │ Value Object              │ Movie, Seat (frozen dataclass)         │ Immutable, hashable, equality by value                             │
+  ├───────────────────────────┼────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤                                                                   
+  │ Strategy (extendable)     │ price_map per Showtime                 │ Different pricing strategies without changing Showtime logic       │
+  ├───────────────────────────┼────────────────────────────────────────┼────────────────────────────────────────────────────────────────────┤                                                                   
+  │ Temporal Hold             │ SeatHold with held_until               │ Reserve without payment; auto-expire prevents deadlocks            │
+  └───────────────────────────┴────────────────────────────────────────┴────────────────────────────────────────────────────────────────────┘                                                                   
+                  
+  ---                                                                                                                                                                                                           
+  Key Concurrency Points to Say in Interview
+                                                                                                                                                                                                                
+  ▎ "Each Showtime has its own threading.Lock. When book_seats acquires it, I first expire stale holds, then validate all-or-nothing, then atomically flip all seats to BOOKED. The lock is released at end of 
+  the with block — even if an exception occurs — because Python's with calls __exit__ in the finally path. Two users racing for the same seat: one acquires the lock first, books it, releases. The second      
+  acquires the lock, calls _expire_holds, sees the seat is BOOKED, returns None. Exactly one winner guaranteed."
+                                                                                                                                                                                                                
+✻ Cooked for 2m 28s
