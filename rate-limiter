@@ -1,0 +1,1012 @@
+⏺ Rate Limiter LLD — Complete Python Deep Dive
+
+  ---                                                                                                                                                                                                           
+  What Are We Building?
+                                                                                                                                                                                                                
+  API Gateway receives request from client_id="user_123" to endpoint="/search"                                                                                                                                
+  Rate Limiter checks: "Has this user exceeded their quota?"                                                                                                                                                    
+      → YES → reject, tell them when to retry                                                                                                                                                                   
+      → NO  → allow, tell them how many requests remain                                                                                                                                                         
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                           
+  Step 1 — Understand the Input and Output First                                                                                                                                                                
+                                                                                                                                                                                                                
+  Input:
+  # What comes in per request                                                                                                                                                                                   
+  client_id = "user_123"    # who is making the request                                                                                                                                                       
+  endpoint  = "/search"     # which API they're hitting
+                                                                                                                                                                                                                
+  # Config loaded at startup                                                                                                                                                                                    
+  configs = [                                                                                                                                                                                                   
+      {                                                                                                                                                                                                         
+          "endpoint": "/search",                                                                                                                                                                              
+          "algorithm": "TokenBucket",
+          "algoConfig": {                                                                                                                                                                                       
+              "capacity": 1000,
+              "refillRatePerSecond": 10                                                                                                                                                                         
+          }                                                                                                                                                                                                   
+      },                                                                                                                                                                                                        
+      { 
+          "endpoint": "/upload",                                                                                                                                                                                
+          "algorithm": "SlidingWindowLog",                                                                                                                                                                    
+          "algoConfig": {                 
+              "maxRequests": 100,                                                                                                                                                                               
+              "windowMs": 60000  
+          }                                                                                                                                                                                                     
+      }                                                                                                                                                                                                       
+  ]                                                                                                                                                                                                             
+   
+  default_config = {                                                                                                                                                                                            
+      "algorithm": "TokenBucket",                                                                                                                                                                             
+      "algoConfig": {            
+          "capacity": 100,
+          "refillRatePerSecond": 1
+      }                                                                                                                                                                                                         
+  }
+                                                                                                                                                                                                                
+  Output:                                                                                                                                                                                                     
+  # What comes out per request
+  {                           
+      "allowed": True,       # can the request proceed?
+      "remaining": 999,      # how many requests left in quota?
+      "retry_after_ms": None # if denied, wait this long before retry                                                                                                                                           
+  }                                                                                                                                                                                                             
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                           
+  Step 2 — Identify the Classes (Entities)                                                                                                                                                                      
+                                                                                                                                                                                                              
+  Before writing any code, identify what needs to exist:
+                                                                                                                                                                                                                
+  RateLimiter      → the front door. receives (client_id, endpoint),
+                     looks up which algorithm to use, delegates to it                                                                                                                                           
+                                                                                                                                                                                                                
+  Limiter          → abstract contract (interface) that ALL algorithms                                                                                                                                          
+                     must follow. One method: allow(key)                                                                                                                                                        
+                                                                                                                                                                                                                
+  TokenBucketLimiter    → implements Limiter using token bucket algorithm                                                                                                                                       
+  SlidingWindowLimiter  → implements Limiter using sliding window log algorithm                                                                                                                                 
+                                                                                                                                                                                                                
+  LimiterFactory   → given raw config dict, creates the right Limiter object                                                                                                                                    
+  
+  RateLimitResult  → structured return value (allowed, remaining, retry_after_ms)                                                                                                                               
+                                                                                                                                                                                                              
+  Why not just one big class?                                                                                                                                                                                   
+                                                                                                                                                                                                              
+  # BAD — everything in one class                                                                                                                                                                               
+  class RateLimiter:                                                                                                                                                                                          
+      def allow(self, client_id, endpoint):
+          config = self.configs[endpoint]                                                                                                                                                                       
+          if config["algorithm"] == "TokenBucket":
+              # token bucket logic here                                                                                                                                                                         
+          elif config["algorithm"] == "SlidingWindowLog":                                                                                                                                                       
+              # sliding window logic here
+          # adding new algorithm = modify this class = risky                                                                                                                                                    
+                                                                                                                                                                                                                
+  # GOOD — each algorithm is its own class                                                                                                                                                                      
+  # Adding new algorithm = add new class, touch nothing else                                                                                                                                                    
+                                                                                                                                                                                                                
+  This is the Open/Closed Principle — open for extension, closed for modification.                                                                                                                              
+  
+  ---                                                                                                                                                                                                           
+  Step 3 — RateLimitResult (Start Here, It's Simplest)                                                                                                                                                        
+                                                                                                                                                                                                                
+  from dataclasses import dataclass
+  from typing import Optional                                                                                                                                                                                   
+                                                                                                                                                                                                              
+  @dataclass(frozen=True)   # frozen=True makes it immutable                                                                                                                                                    
+  class RateLimitResult:                                                                                                                                                                                      
+      allowed: bool
+      remaining: int
+      retry_after_ms: Optional[int]  # None when allowed, int when denied                                                                                                                                       
+  
+  Why dataclass?                                                                                                                                                                                                
+                                                                                                                                                                                                              
+  # Without dataclass — verbose                                                                                                                                                                                 
+  class RateLimitResult:                                                                                                                                                                                      
+      def __init__(self, allowed, remaining, retry_after_ms):
+          self.allowed = allowed                                                                                                                                                                                
+          self.remaining = remaining
+          self.retry_after_ms = retry_after_ms                                                                                                                                                                  
+                                                                                                                                                                                                              
+  # With dataclass — clean, auto-generates __init__, __repr__, __eq__                                                                                                                                           
+  @dataclass(frozen=True)
+  class RateLimitResult:                                                                                                                                                                                        
+      allowed: bool                                                                                                                                                                                           
+      remaining: int                                                                                                                                                                                            
+      retry_after_ms: Optional[int]
+                                                                                                                                                                                                                
+  Why frozen=True?                                                                                                                                                                                            
+
+  # frozen=True prevents mutation after creation
+  result = RateLimitResult(allowed=True, remaining=99, retry_after_ms=None)                                                                                                                                     
+  result.allowed = False   # raises FrozenInstanceError — good!
+                                                                                                                                                                                                                
+  # Rate limit decisions should NEVER be modified after creation                                                                                                                                                
+  # Immutability prevents bugs where something accidentally changes the result                                                                                                                                  
+                                                                                                                                                                                                                
+  Usage:                                                                                                                                                                                                      
+  # Creating results                                                                                                                                                                                            
+  success = RateLimitResult(allowed=True, remaining=99, retry_after_ms=None)                                                                                                                                  
+  denied  = RateLimitResult(allowed=False, remaining=0, retry_after_ms=800) 
+                                                                                                                                                                                                                
+  # Reading results                                                                                                                                                                                             
+  if result.allowed:                                                                                                                                                                                            
+      forward_request()                                                                                                                                                                                         
+  else:                                                                                                                                                                                                       
+      return 429, f"Retry after {result.retry_after_ms}ms"
+
+  ---                                                                                                                                                                                                           
+  Step 4 — Limiter Interface (Abstract Base Class in Python)
+                                                                                                                                                                                                                
+  Python doesn't have interfaces like Java. We use ABC (Abstract Base Class):                                                                                                                                 
+                                                                                                                                                                                                                
+  from abc import ABC, abstractmethod                                                                                                                                                                         
+                                                                                                                                                                                                                
+  class Limiter(ABC):                                                                                                                                                                                         
+
+      @abstractmethod
+      def allow(self, key: str) -> RateLimitResult:
+          """                                                                                                                                                                                                   
+          Check if a request from 'key' (client_id) should be allowed.
+          Returns RateLimitResult with decision + metadata.                                                                                                                                                     
+          """                                                                                                                                                                                                 
+          pass                                                                                                                                                                                                  
+                                                                                                                                                                                                              
+  Why ABC?
+
+  # If you forget to implement allow() in a subclass:
+  class BrokenLimiter(Limiter):                                                                                                                                                                                 
+      pass   # forgot to implement allow()
+                                                                                                                                                                                                                
+  obj = BrokenLimiter()                                                                                                                                                                                       
+  # TypeError: Can't instantiate abstract class BrokenLimiter                                                                                                                                                   
+  # with abstract method allow                                                                                                                                                                                  
+  # ← Python tells you immediately, not at runtime when allow() is called
+                                                                                                                                                                                                                
+  The contract:                                                                                                                                                                                                 
+                                                                                                                                                                                                                
+  # Every algorithm MUST implement this exact signature                                                                                                                                                         
+  def allow(self, key: str) -> RateLimitResult:                                                                                                                                                                 
+  
+  # key = client_id ("user_123", "ip_192.168.1.1", etc.)                                                                                                                                                        
+  # Returns structured result — never None, never raises exception                                                                                                                                            
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                         
+  Step 5 — Token Bucket Algorithm (Deep Explanation)                                                                                                                                                            
+                                                                                                                                                                                                              
+  What is Token Bucket?
+                                                                                                                                                                                                                
+  Imagine a physical bucket that holds tokens (coins).
+                                                                                                                                                                                                                
+  Rules:                                                                                                                                                                                                      
+    1. Bucket has a maximum capacity (e.g., 10 tokens)                                                                                                                                                          
+    2. Starts full                                                                                                                                                                                            
+    3. Each request takes 1 token                                                                                                                                                                               
+    4. Tokens refill at a fixed rate (e.g., 1 token/second)
+    5. If bucket empty → request denied                                                                                                                                                                         
+                                                                                                                                                                                                              
+  Example: capacity=10, refill=1/second                                                                                                                                                                         
+    t=0:    bucket has 10 tokens                                                                                                                                                                              
+    t=0:    make 10 requests → bucket empty                                                                                                                                                                     
+    t=0:    make 11th request → DENIED (bucket empty)                                                                                                                                                           
+    t=1:    1 token refilled → make 1 request → allowed                                                                                                                                                         
+    t=10:   10 tokens refilled → burst of 10 allowed again                                                                                                                                                      
+                                                                                                                                                                                                                
+  Why Use Token Bucket?                                                                                                                                                                                         
+                                                                                                                                                                                                                
+  Allows BURSTS — a client can make many requests quickly                                                                                                                                                       
+    (useful for search APIs, batch operations)                                                                                                                                                                  
+  
+  Maintains AVERAGE RATE — over time, can't exceed refill rate                                                                                                                                                  
+    (protects your API from sustained abuse)                                                                                                                                                                  
+                                                                                                                                                                                                                
+  Used by: Stripe, AWS API Gateway, GitHub API                                                                                                                                                                  
+                                                                                                                                                                                                                
+  Per-Client State                                                                                                                                                                                              
+                                                                                                                                                                                                              
+  Each client needs their own "bucket":
+
+  @dataclass
+  class TokenBucket:                                                                                                                                                                                            
+      tokens: float          # current token count (float because partial tokens)
+      last_refill_time: float  # when we last calculated tokens (unix timestamp in ms)                                                                                                                          
+                                                                                                                                                                                                                
+  Why float for tokens?                                                                                                                                                                                         
+                                                                                                                                                                                                                
+  # Scenario: refill_rate=1/sec, elapsed=500ms                                                                                                                                                                
+  tokens_to_add = (500 * 1) / 1000 = 0.5 tokens                                                                                                                                                                 
+                                                                                                                                                                                                                
+  # If int: 0.5 → 0 (truncated) — refill never happens for < 1 second                                                                                                                                           
+  # If float: 0.5 stored — accumulates correctly over time                                                                                                                                                      
+                                                                                                                                                                                                                
+  # After another 500ms:                                                                                                                                                                                      
+  tokens_to_add = 0.5 more                                                                                                                                                                                      
+  total = 0.5 + 0.5 = 1.0  ← now we have a full token!                                                                                                                                                          
+                                                                                                                                                                                                                
+  Full Implementation with Step-by-Step Comments                                                                                                                                                                
+                                                                                                                                                                                                                
+  import time                                                                                                                                                                                                 
+  import math
+  from dataclasses import dataclass                                                                                                                                                                             
+  from typing import Dict
+                                                                                                                                                                                                                
+  @dataclass                                                                                                                                                                                                  
+  class TokenBucket:
+      tokens: float
+      last_refill_time: float
+
+  class TokenBucketLimiter(Limiter):                                                                                                                                                                            
+  
+      def __init__(self, capacity: int, refill_rate_per_second: int):                                                                                                                                           
+          self.capacity = capacity                    # max tokens (burst limit)                                                                                                                              
+          self.refill_rate = refill_rate_per_second  # tokens added per second                                                                                                                                  
+          self.buckets: Dict[str, TokenBucket] = {}  # per-client state                                                                                                                                         
+                                                                                                                                                                                                                
+      def _get_or_create_bucket(self, key: str) -> TokenBucket:                                                                                                                                                 
+          if key not in self.buckets:                                                                                                                                                                         
+              # New client → starts with FULL bucket                                                                                                                                                            
+              # last_refill_time = now (no refill needed yet)                                                                                                                                                   
+              self.buckets[key] = TokenBucket(                                                                                                                                                                  
+                  tokens=self.capacity,                                                                                                                                                                         
+                  last_refill_time=self._now()                                                                                                                                                                  
+              )                                                                                                                                                                                               
+          return self.buckets[key]
+
+      def _now(self) -> float:
+          # Returns current time in MILLISECONDS
+          # time.time() returns seconds, multiply by 1000 for ms                                                                                                                                                
+          return time.time() * 1000
+                                                                                                                                                                                                                
+      def allow(self, key: str) -> RateLimitResult:                                                                                                                                                             
+  
+          # STEP 1: Get or create this client's bucket                                                                                                                                                          
+          bucket = self._get_or_create_bucket(key)                                                                                                                                                            
+                                                                                                                                                                                                                
+          # STEP 2: Calculate how many tokens have refilled since last request                                                                                                                                  
+          now = self._now()                                                                                                                                                                                     
+          elapsed_ms = now - bucket.last_refill_time                                                                                                                                                            
+                                                                                                                                                                                                              
+          # Convert elapsed time to tokens:                                                                                                                                                                     
+          # elapsed_ms=1000, rate=10/sec → 10 tokens
+          # elapsed_ms=500,  rate=10/sec → 5 tokens                                                                                                                                                             
+          # elapsed_ms=100,  rate=10/sec → 1 token                                                                                                                                                            
+          tokens_to_add = (elapsed_ms * self.refill_rate) / 1000                                                                                                                                                
+                                                                                                                                                                                                              
+          # Add tokens but don't exceed capacity (bucket can't overflow)                                                                                                                                        
+          bucket.tokens = min(self.capacity, bucket.tokens + tokens_to_add)                                                                                                                                   
+                                                                                                                                                                                                                
+          # Update last_refill_time to NOW                                                                                                                                                                    
+          # Next request will calculate elapsed from this moment                                                                                                                                                
+          bucket.last_refill_time = now                                                                                                                                                                         
+  
+          # STEP 3: Check if we have at least 1 token available                                                                                                                                                 
+          if bucket.tokens >= 1:                                                                                                                                                                              
+                                                                                                                                                                                                                
+              # STEP 4a: ALLOW — consume 1 token                                                                                                                                                                
+              bucket.tokens -= 1
+                                                                                                                                                                                                                
+              return RateLimitResult(                                                                                                                                                                         
+                  allowed=True,
+                  remaining=int(bucket.tokens),  # floor (don't show partial tokens)
+                  retry_after_ms=None             # no retry needed                                                                                                                                             
+              )                                                                                                                                                                                                 
+                                                                                                                                                                                                                
+          else:                                                                                                                                                                                                 
+                                                                                                                                                                                                              
+              # STEP 4b: DENY — calculate when enough tokens will exist                                                                                                                                         
+              # Need (1 - current_tokens) more tokens
+              tokens_needed = 1 - bucket.tokens                                                                                                                                                                 
+                                                                                                                                                                                                                
+              # Time to accumulate those tokens:
+              # tokens_needed=0.7, rate=10/sec → 0.7/10 sec = 0.07 sec = 70ms                                                                                                                                   
+              # Math: tokens_needed / rate * 1000 (convert sec to ms)                                                                                                                                           
+              retry_after_ms = math.ceil(                                                                                                                                                                       
+                  (tokens_needed / self.refill_rate) * 1000                                                                                                                                                     
+              )                                                                                                                                                                                                 
+                                                                                                                                                                                                              
+              return RateLimitResult(                                                                                                                                                                           
+                  allowed=False,
+                  remaining=0,                                                                                                                                                                                  
+                  retry_after_ms=retry_after_ms                                                                                                                                                               
+              )
+
+  Walkthrough with Real Numbers                                                                                                                                                                                 
+  
+  # Config: capacity=10, refill_rate=1/second                                                                                                                                                                   
+  limiter = TokenBucketLimiter(capacity=10, refill_rate_per_second=1)                                                                                                                                         
+                                                                                                                                                                                                                
+  # --- Request 1 at t=0ms ---
+  result = limiter.allow("user_123")                                                                                                                                                                            
+  # bucket created: tokens=10, last_refill=0                                                                                                                                                                    
+  # elapsed=0ms → tokens_to_add=0
+  # tokens=10 → 10 >= 1 → ALLOW                                                                                                                                                                                 
+  # tokens after: 9                                                                                                                                                                                             
+  # Result: allowed=True, remaining=9, retry_after_ms=None                                                                                                                                                      
+                                                                                                                                                                                                                
+  # --- Request 2 at t=500ms ---                                                                                                                                                                              
+  result = limiter.allow("user_123")
+  # elapsed = 500-0 = 500ms                                                                                                                                                                                     
+  # tokens_to_add = (500 * 1) / 1000 = 0.5
+  # tokens = min(10, 9 + 0.5) = 9.5                                                                                                                                                                             
+  # last_refill = 500                                                                                                                                                                                         
+  # 9.5 >= 1 → ALLOW                                                                                                                                                                                            
+  # tokens after: 8.5                                                                                                                                                                                           
+  # Result: allowed=True, remaining=8, retry_after_ms=None
+                                                                                                                                                                                                                
+  # --- 9 more rapid requests (tokens drain to ~0) ---                                                                                                                                                          
+  # After 9 more requests, tokens ≈ 0.2
+                                                                                                                                                                                                                
+  # --- Request at t=1000ms (bucket almost empty) ---                                                                                                                                                           
+  result = limiter.allow("user_123")
+  # elapsed = 1000-500 = 500ms (from last_refill_time)                                                                                                                                                          
+  # tokens_to_add = (500 * 1) / 1000 = 0.5                                                                                                                                                                      
+  # tokens = min(10, 0.2 + 0.5) = 0.7                                                                                                                                                                           
+  # 0.7 < 1 → DENY                                                                                                                                                                                              
+  # tokens_needed = 1 - 0.7 = 0.3                                                                                                                                                                               
+  # retry_after_ms = ceil(0.3 / 1 * 1000) = ceil(300) = 300                                                                                                                                                     
+  # Result: allowed=False, remaining=0, retry_after_ms=300                                                                                                                                                      
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                           
+  Step 6 — Sliding Window Log Algorithm (Deep Explanation)                                                                                                                                                    
+                                                          
+  What is Sliding Window Log?
+                                                                                                                                                                                                                
+  Instead of tokens, track EXACT TIMESTAMPS of every request.
+                                                                                                                                                                                                                
+  Rules:                                                                                                                                                                                                      
+    1. Keep a queue of timestamps for each client                                                                                                                                                               
+    2. When request arrives:                                                                                                                                                                                  
+       a. Remove timestamps older than the window (they're expired)                                                                                                                                             
+       b. Count remaining timestamps                                                                                                                                                                            
+       c. If count < max_requests → allow, add current timestamp                                                                                                                                                
+       d. If count >= max_requests → deny                                                                                                                                                                       
+    3. Window is SLIDING — always "last N milliseconds"                                                                                                                                                       
+                                                                                                                                                                                                                
+  Example: maxRequests=3, window=60000ms (1 minute)                                                                                                                                                             
+    10:00:00 → request → log=[10:00:00] → count=1 < 3 → ALLOW                                                                                                                                                   
+    10:00:10 → request → log=[10:00:00, 10:00:10] → count=2 < 3 → ALLOW                                                                                                                                         
+    10:00:20 → request → log=[10:00:00, 10:00:10, 10:00:20] → count=3 = 3 → ALLOW                                                                                                                               
+    10:00:30 → request → count=3 already → DENY                                                                                                                                                                 
+                retry_after_ms = 10:00:00 + 60s - 10:00:30 = 30 seconds                                                                                                                                         
+    10:01:01 → request → 10:00:00 now expired (>60s ago)                                                                                                                                                        
+                log=[10:00:10, 10:00:20] → count=2 < 3 → ALLOW                                                                                                                                                  
+                                                                                                                                                                                                                
+  Why Use Sliding Window Log?                                                                                                                                                                                   
+                                                                                                                                                                                                                
+  PERFECT accuracy — no approximation                                                                                                                                                                           
+    Each request is counted in EXACTLY the window it belongs to
+                                                                                                                                                                                                                
+  Downside: memory                                                                                                                                                                                            
+    Need to store every timestamp                                                                                                                                                                               
+    Client making 1000 req/min → 1000 timestamps stored                                                                                                                                                       
+                                                                                                                                                                                                                
+  Use when: accuracy is critical, request rate is moderate                                                                                                                                                      
+  Use Token Bucket when: bursts allowed, memory is concern                                                                                                                                                      
+                                                                                                                                                                                                                
+  Per-Client State                                                                                                                                                                                            
+                                                                                                                                                                                                                
+  from collections import deque                                                                                                                                                                               
+                                                                                                                                                                                                                
+  # deque = double-ended queue
+  # O(1) append to right, O(1) remove from left                                                                                                                                                                 
+  # Perfect for sliding window: add new timestamps to right,                                                                                                                                                    
+  # remove old timestamps from left                                                                                                                                                                             
+                                                                                                                                                                                                                
+  Why deque and not list?                                                                                                                                                                                       
+                                                                                                                                                                                                              
+  # list.pop(0) = O(n) — shifts all elements left
+  # deque.popleft() = O(1) — pointer move only                                                                                                                                                                  
+                                                                                                                                                                                                                
+  # With 1000 timestamps per client, 10k clients:                                                                                                                                                               
+  # list:  10k × 1000 × O(n) = 10 billion operations per cleanup                                                                                                                                                
+  # deque: 10k × 1000 × O(1) = 10 million operations per cleanup                                                                                                                                                
+                                                                                                                                                                                                                
+  Full Implementation                                                                                                                                                                                           
+                                                                                                                                                                                                                
+  from collections import deque                                                                                                                                                                               
+  from dataclasses import dataclass, field
+  from typing import Dict
+                                                                                                                                                                                                                
+  @dataclass
+  class RequestLog:                                                                                                                                                                                             
+      # deque of timestamps (in milliseconds) of recent requests                                                                                                                                              
+      # oldest at left (index 0), newest at right (index -1)                                                                                                                                                    
+      timestamps: deque = field(default_factory=deque)                                                                                                                                                          
+                                                                                                                                                                                                                
+  class SlidingWindowLogLimiter(Limiter):                                                                                                                                                                       
+                                                                                                                                                                                                              
+      def __init__(self, max_requests: int, window_ms: int):                                                                                                                                                    
+          self.max_requests = max_requests  # max allowed per window                                                                                                                                          
+          self.window_ms = window_ms        # window size in milliseconds                                                                                                                                       
+          self.logs: Dict[str, RequestLog] = {}  # per-client request history
+                                                                                                                                                                                                                
+      def _get_or_create_log(self, key: str) -> RequestLog:                                                                                                                                                   
+          if key not in self.logs:                                                                                                                                                                              
+              # New client → empty history                                                                                                                                                                    
+              self.logs[key] = RequestLog()                                                                                                                                                                     
+          return self.logs[key]
+                                                                                                                                                                                                                
+      def _now(self) -> int:                                                                                                                                                                                  
+          return int(time.time() * 1000)  # milliseconds
+                                                                                                                                                                                                                
+      def allow(self, key: str) -> RateLimitResult:
+                                                                                                                                                                                                                
+          # STEP 1: Get or create this client's request log                                                                                                                                                   
+          log = self._get_or_create_log(key)
+                                                                                                                                                                                                                
+          now = self._now()
+                                                                                                                                                                                                                
+          # STEP 2: Calculate cutoff — anything older than this is expired                                                                                                                                      
+          # If window=60000ms and now=100000ms:
+          # cutoff = 100000 - 60000 = 40000ms                                                                                                                                                                   
+          # Any timestamp < 40000 is outside our window → remove it                                                                                                                                           
+          cutoff = now - self.window_ms                                                                                                                                                                         
+                                                                                                                                                                                                              
+          # STEP 3: Remove expired timestamps from the LEFT (oldest)                                                                                                                                            
+          # deque: [old ... new]                                                                                                                                                                              
+          # Keep removing from left while timestamp < cutoff                                                                                                                                                    
+          while log.timestamps and log.timestamps[0] < cutoff:                                                                                                                                                
+              log.timestamps.popleft()   # O(1)                                                                                                                                                                 
+                                                                                                                                                                                                              
+          # STEP 4: Count remaining timestamps = requests in current window                                                                                                                                     
+          current_count = len(log.timestamps)                                                                                                                                                                 
+                                                                                                                                                                                                                
+          # STEP 5: Check if under the limit                                                                                                                                                                    
+          if current_count < self.max_requests:
+                                                                                                                                                                                                                
+              # STEP 6a: ALLOW — record this request's timestamp                                                                                                                                              
+              log.timestamps.append(now)  # add to right (newest)
+                                                                                                                                                                                                                
+              # remaining = how many more requests allowed                                                                                                                                                      
+              # We just added one, so:                                                                                                                                                                          
+              remaining = self.max_requests - len(log.timestamps)                                                                                                                                               
+                                                                                                                                                                                                                
+              return RateLimitResult(
+                  allowed=True,                                                                                                                                                                                 
+                  remaining=remaining,                                                                                                                                                                        
+                  retry_after_ms=None
+              )
+
+          else:
+
+              # STEP 6b: DENY — calculate when oldest will expire                                                                                                                                               
+              # oldest timestamp = log.timestamps[0] (leftmost)
+              # It expires at: oldest + window_ms                                                                                                                                                               
+              # Time until expiry: (oldest + window_ms) - now                                                                                                                                                 
+              oldest = log.timestamps[0]                                                                                                                                                                        
+              retry_after_ms = (oldest + self.window_ms) - now                                                                                                                                                
+                                                                                                                                                                                                                
+              return RateLimitResult(                                                                                                                                                                           
+                  allowed=False,
+                  remaining=0,                                                                                                                                                                                  
+                  retry_after_ms=retry_after_ms                                                                                                                                                               
+              )
+
+  Walkthrough with Real Numbers
+
+  # Config: max_requests=3, window_ms=60000 (1 minute)
+  limiter = SlidingWindowLogLimiter(max_requests=3, window_ms=60000)                                                                                                                                            
+  
+  # --- t=100000ms ---                                                                                                                                                                                          
+  result = limiter.allow("user_123")                                                                                                                                                                          
+  # log created: timestamps=deque([])                                                                                                                                                                           
+  # cutoff = 100000 - 60000 = 40000                                                                                                                                                                           
+  # nothing to remove (empty)                                                                                                                                                                                   
+  # count = 0 < 3 → ALLOW
+  # append 100000 → timestamps=deque([100000])                                                                                                                                                                  
+  # remaining = 3 - 1 = 2                                                                                                                                                                                     
+  # Result: allowed=True, remaining=2                                                                                                                                                                           
+                                                                                                                                                                                                              
+  # --- t=100010ms ---                                                                                                                                                                                          
+  result = limiter.allow("user_123")                                                                                                                                                                          
+  # cutoff = 100010 - 60000 = 40010
+  # 100000 > 40010 → nothing removed                                                                                                                                                                            
+  # count = 1 < 3 → ALLOW
+  # timestamps=deque([100000, 100010])                                                                                                                                                                          
+  # remaining = 3 - 2 = 1                                                                                                                                                                                     
+  # Result: allowed=True, remaining=1                                                                                                                                                                           
+                                                                                                                                                                                                              
+  # --- t=100020ms ---                                                                                                                                                                                          
+  result = limiter.allow("user_123")
+  # cutoff = 40020, nothing expired                                                                                                                                                                             
+  # count = 2 < 3 → ALLOW                                                                                                                                                                                     
+  # timestamps=deque([100000, 100010, 100020])                                                                                                                                                                  
+  # remaining = 3 - 3 = 0
+  # Result: allowed=True, remaining=0                                                                                                                                                                           
+                                                                                                                                                                                                              
+  # --- t=100030ms ---
+  result = limiter.allow("user_123")
+  # cutoff = 40030, nothing expired (all timestamps > 40030)                                                                                                                                                    
+  # count = 3 = max_requests → DENY                                                                                                                                                                             
+  # oldest = 100000                                                                                                                                                                                             
+  # retry_after_ms = (100000 + 60000) - 100030 = 160000 - 100030 = 59970ms                                                                                                                                      
+  # Result: allowed=False, remaining=0, retry_after_ms=59970                                                                                                                                                    
+  
+  # --- t=160001ms (60 seconds + 1ms later) ---                                                                                                                                                                 
+  result = limiter.allow("user_123")                                                                                                                                                                          
+  # cutoff = 160001 - 60000 = 100001                                                                                                                                                                            
+  # 100000 < 100001 → REMOVE 100000 from left                                                                                                                                                                   
+  # 100010 > 100001 → stop removing
+  # timestamps=deque([100010, 100020])                                                                                                                                                                          
+  # count = 2 < 3 → ALLOW ✓                                                                                                                                                                                   
+  # timestamps=deque([100010, 100020, 160001])                                                                                                                                                                  
+  # Result: allowed=True, remaining=0                                                                                                                                                                         
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                         
+  Step 7 — LimiterFactory
+                                                                                                                                                                                                                
+  The factory's job: given raw config dict → return correct Limiter object.
+                                                                                                                                                                                                                
+  class LimiterFactory:                                                                                                                                                                                       
+                                                                                                                                                                                                                
+      def create(self, config: dict) -> Limiter:                                                                                                                                                                
+          """
+          config looks like:                                                                                                                                                                                    
+          {                                                                                                                                                                                                   
+              "endpoint": "/search",          ← optional (factory ignores this)                                                                                                                                 
+              "algorithm": "TokenBucket",     ← required discriminator
+              "algoConfig": {                 ← algorithm-specific params                                                                                                                                       
+                  "capacity": 1000,                                                                                                                                                                           
+                  "refillRatePerSecond": 10                                                                                                                                                                     
+              }                                                                                                                                                                                                 
+          }
+          """                                                                                                                                                                                                   
+          algorithm = config.get("algorithm")                                                                                                                                                                 
+          algo_config = config.get("algoConfig", {})
+
+          if algorithm == "TokenBucket":                                                                                                                                                                        
+              return TokenBucketLimiter(
+                  capacity=algo_config["capacity"],                                                                                                                                                             
+                  refill_rate_per_second=algo_config["refillRatePerSecond"]                                                                                                                                   
+              )                                                                                                                                                                                                 
+  
+          elif algorithm == "SlidingWindowLog":                                                                                                                                                                 
+              return SlidingWindowLogLimiter(                                                                                                                                                                 
+                  max_requests=algo_config["maxRequests"],
+                  window_ms=algo_config["windowMs"]
+              )                                                                                                                                                                                                 
+  
+          else:                                                                                                                                                                                                 
+              raise ValueError(f"Unknown algorithm: {algorithm}")                                                                                                                                             
+
+  Why raise ValueError and not return None?
+
+  # Returning None → caller gets NoneType error later, confusing
+  limiter = factory.create({"algorithm": "Unknown"})                                                                                                                                                            
+  limiter.allow("user_123")  # AttributeError: 'NoneType' has no 'allow'                                                                                                                                        
+  # ← hard to debug, no info about what went wrong                                                                                                                                                              
+                                                                                                                                                                                                                
+  # Raising ValueError → immediate, clear error at startup                                                                                                                                                      
+  # ValueError: Unknown algorithm: Unknown                                                                                                                                                                      
+  # ← clear, points exactly to the problem                                                                                                                                                                      
+  
+  Pattern used: Switch/dispatch on discriminator field                                                                                                                                                          
+                                                                                                                                                                                                              
+  # "algorithm" field is the DISCRIMINATOR — tells us which class to create                                                                                                                                     
+  # "algoConfig" is HETEROGENEOUS — different fields per algorithm                                                                                                                                              
+                                                                                                                                                                                                                
+  # This is the classic Factory pattern:                                                                                                                                                                        
+  # Same interface (Limiter), different implementations,                                                                                                                                                        
+  # runtime decision based on config data                                                                                                                                                                       
+                                                                                                                                                                                                                
+  ---
+  Step 8 — RateLimiter (Orchestrator)                                                                                                                                                                           
+                                                                                                                                                                                                                
+  from typing import List, Dict
+                                                                                                                                                                                                                
+  class RateLimiter:                                                                                                                                                                                          
+
+      def __init__(self, configs: List[dict], default_config: dict):                                                                                                                                            
+          factory = LimiterFactory()
+                                                                                                                                                                                                                
+          # Build endpoint → limiter map                                                                                                                                                                        
+          self._limiters: Dict[str, Limiter] = {}
+                                                                                                                                                                                                                
+          for config in configs:                                                                                                                                                                                
+              endpoint = config.get("endpoint")
+              if endpoint is None:                                                                                                                                                                              
+                  continue  # skip invalid configs silently                                                                                                                                                   
+              limiter = factory.create(config)                                                                                                                                                                  
+              self._limiters[endpoint] = limiter
+                                                                                                                                                                                                                
+          # Create default limiter for unknown endpoints                                                                                                                                                        
+          self._default_limiter = factory.create(default_config)
+                                                                                                                                                                                                                
+      def allow(self, client_id: str, endpoint: str) -> RateLimitResult:                                                                                                                                        
+          # Look up limiter for this endpoint
+          # Fall back to default if endpoint not configured                                                                                                                                                     
+          limiter = self._limiters.get(endpoint, self._default_limiter)                                                                                                                                         
+  
+          # Delegate to the algorithm — pass client_id as the key                                                                                                                                               
+          return limiter.allow(client_id)                                                                                                                                                                     
+                                                                                                                                                                                                                
+  Why pass client_id to limiter.allow(), not endpoint?                                                                                                                                                          
+  
+  # Rate limiting is PER CLIENT, not per endpoint                                                                                                                                                               
+  # The endpoint already determined WHICH limiter to use                                                                                                                                                        
+  # The limiter tracks per-client state using client_id as key                                                                                                                                                  
+                                                                                                                                                                                                                
+  # Flow:                                                                                                                                                                                                       
+  # endpoint → selects which limiter (TokenBucket or SlidingWindow)                                                                                                                                           
+  # client_id → selects which bucket/log within that limiter                                                                                                                                                    
+                                                                                                                                                                                                                
+  # Result: each client has independent quota per endpoint                                                                                                                                                      
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                           
+  Step 9 — Complete Working Code (All Together)                                                                                                                                                               
+                                                                                                                                                                                                                
+  import time
+  import math                                                                                                                                                                                                   
+  from abc import ABC, abstractmethod                                                                                                                                                                         
+  from collections import deque
+  from dataclasses import dataclass, field
+  from typing import Dict, List, Optional
+                                                                                                                                                                                                                
+  
+  # ─────────────────────────────────────────                                                                                                                                                                   
+  # RESULT VALUE OBJECT                                                                                                                                                                                       
+  # ─────────────────────────────────────────                                                                                                                                                                   
+  
+  @dataclass(frozen=True)                                                                                                                                                                                       
+  class RateLimitResult:                                                                                                                                                                                      
+      allowed: bool
+      remaining: int
+      retry_after_ms: Optional[int]                                                                                                                                                                             
+  
+                                                                                                                                                                                                                
+  # ─────────────────────────────────────────                                                                                                                                                                 
+  # LIMITER INTERFACE
+  # ─────────────────────────────────────────
+                                                                                                                                                                                                                
+  class Limiter(ABC):
+      @abstractmethod                                                                                                                                                                                           
+      def allow(self, key: str) -> RateLimitResult:                                                                                                                                                           
+          pass
+
+                                                                                                                                                                                                                
+  # ─────────────────────────────────────────
+  # TOKEN BUCKET ALGORITHM                                                                                                                                                                                      
+  # ─────────────────────────────────────────                                                                                                                                                                 
+
+  @dataclass
+  class TokenBucket:
+      tokens: float                                                                                                                                                                                             
+      last_refill_time: float
+                                                                                                                                                                                                                
+                                                                                                                                                                                                              
+  class TokenBucketLimiter(Limiter):
+
+      def __init__(self, capacity: int, refill_rate_per_second: int):                                                                                                                                           
+          self.capacity = capacity
+          self.refill_rate = refill_rate_per_second                                                                                                                                                             
+          self.buckets: Dict[str, TokenBucket] = {}                                                                                                                                                           
+
+      def _now(self) -> float:                                                                                                                                                                                  
+          return time.time() * 1000
+                                                                                                                                                                                                                
+      def _get_or_create_bucket(self, key: str) -> TokenBucket:                                                                                                                                               
+          if key not in self.buckets:
+              self.buckets[key] = TokenBucket(                                                                                                                                                                  
+                  tokens=self.capacity,
+                  last_refill_time=self._now()                                                                                                                                                                  
+              )                                                                                                                                                                                               
+          return self.buckets[key]
+
+      def allow(self, key: str) -> RateLimitResult:                                                                                                                                                             
+          bucket = self._get_or_create_bucket(key)
+                                                                                                                                                                                                                
+          now = self._now()                                                                                                                                                                                   
+          elapsed_ms = now - bucket.last_refill_time
+          tokens_to_add = (elapsed_ms * self.refill_rate) / 1000                                                                                                                                                
+          bucket.tokens = min(self.capacity, bucket.tokens + tokens_to_add)
+          bucket.last_refill_time = now                                                                                                                                                                         
+                                                                                                                                                                                                              
+          if bucket.tokens >= 1:                                                                                                                                                                                
+              bucket.tokens -= 1                                                                                                                                                                              
+              return RateLimitResult(
+                  allowed=True,                                                                                                                                                                                 
+                  remaining=int(bucket.tokens),
+                  retry_after_ms=None                                                                                                                                                                           
+              )                                                                                                                                                                                               
+          else:
+              tokens_needed = 1 - bucket.tokens
+              retry_after_ms = math.ceil(
+                  (tokens_needed / self.refill_rate) * 1000                                                                                                                                                     
+              )
+              return RateLimitResult(                                                                                                                                                                           
+                  allowed=False,                                                                                                                                                                              
+                  remaining=0,
+                  retry_after_ms=retry_after_ms
+              )                                                                                                                                                                                                 
+  
+                                                                                                                                                                                                                
+  # ─────────────────────────────────────────                                                                                                                                                                 
+  # SLIDING WINDOW LOG ALGORITHM
+  # ─────────────────────────────────────────
+
+  @dataclass
+  class RequestLog:
+      timestamps: deque = field(default_factory=deque)                                                                                                                                                          
+  
+                                                                                                                                                                                                                
+  class SlidingWindowLogLimiter(Limiter):                                                                                                                                                                     
+
+      def __init__(self, max_requests: int, window_ms: int):
+          self.max_requests = max_requests
+          self.window_ms = window_ms                                                                                                                                                                            
+          self.logs: Dict[str, RequestLog] = {}
+                                                                                                                                                                                                                
+      def _now(self) -> int:                                                                                                                                                                                    
+          return int(time.time() * 1000)
+                                                                                                                                                                                                                
+      def _get_or_create_log(self, key: str) -> RequestLog:                                                                                                                                                   
+          if key not in self.logs:
+              self.logs[key] = RequestLog()
+          return self.logs[key]                                                                                                                                                                                 
+  
+      def allow(self, key: str) -> RateLimitResult:                                                                                                                                                             
+          log = self._get_or_create_log(key)                                                                                                                                                                  
+          now = self._now()
+          cutoff = now - self.window_ms                                                                                                                                                                         
+  
+          # Remove expired timestamps                                                                                                                                                                           
+          while log.timestamps and log.timestamps[0] < cutoff:                                                                                                                                                
+              log.timestamps.popleft()
+
+          if len(log.timestamps) < self.max_requests:                                                                                                                                                           
+              log.timestamps.append(now)
+              remaining = self.max_requests - len(log.timestamps)                                                                                                                                               
+              return RateLimitResult(                                                                                                                                                                           
+                  allowed=True,
+                  remaining=remaining,                                                                                                                                                                          
+                  retry_after_ms=None                                                                                                                                                                         
+              )
+          else:
+              oldest = log.timestamps[0]
+              retry_after_ms = (oldest + self.window_ms) - now
+              return RateLimitResult(                                                                                                                                                                           
+                  allowed=False,
+                  remaining=0,                                                                                                                                                                                  
+                  retry_after_ms=retry_after_ms                                                                                                                                                               
+              )
+
+                                                                                                                                                                                                                
+  # ─────────────────────────────────────────
+  # FACTORY                                                                                                                                                                                                     
+  # ─────────────────────────────────────────                                                                                                                                                                 
+
+  class LimiterFactory:
+
+      def create(self, config: dict) -> Limiter:
+          algorithm = config.get("algorithm")
+          algo_config = config.get("algoConfig", {})                                                                                                                                                            
+  
+          if algorithm == "TokenBucket":                                                                                                                                                                        
+              return TokenBucketLimiter(                                                                                                                                                                      
+                  capacity=algo_config["capacity"],
+                  refill_rate_per_second=algo_config["refillRatePerSecond"]
+              )                                                                                                                                                                                                 
+          elif algorithm == "SlidingWindowLog":
+              return SlidingWindowLogLimiter(                                                                                                                                                                   
+                  max_requests=algo_config["maxRequests"],                                                                                                                                                      
+                  window_ms=algo_config["windowMs"]
+              )                                                                                                                                                                                                 
+          else:                                                                                                                                                                                               
+              raise ValueError(f"Unknown algorithm: {algorithm}")
+
+                                                                                                                                                                                                                
+  # ─────────────────────────────────────────
+  # RATE LIMITER (ORCHESTRATOR)                                                                                                                                                                                 
+  # ─────────────────────────────────────────                                                                                                                                                                 
+
+  class RateLimiter:
+
+      def __init__(self, configs: List[dict], default_config: dict):                                                                                                                                            
+          factory = LimiterFactory()
+          self._limiters: Dict[str, Limiter] = {}                                                                                                                                                               
+                                                                                                                                                                                                              
+          for config in configs:
+              endpoint = config.get("endpoint")
+              if endpoint is None:
+                  continue                                                                                                                                                                                      
+              self._limiters[endpoint] = factory.create(config)
+                                                                                                                                                                                                                
+          self._default_limiter = factory.create(default_config)                                                                                                                                              
+
+      def allow(self, client_id: str, endpoint: str) -> RateLimitResult:                                                                                                                                        
+          limiter = self._limiters.get(endpoint, self._default_limiter)
+          return limiter.allow(client_id)                                                                                                                                                                       
+                                                                                                                                                                                                                
+  ---
+  Step 10 — Test It Manually (Verification)                                                                                                                                                                     
+                                                                                                                                                                                                                
+  if __name__ == "__main__":
+                                                                                                                                                                                                                
+      configs = [                                                                                                                                                                                             
+          {
+              "endpoint": "/search",
+              "algorithm": "TokenBucket",
+              "algoConfig": {"capacity": 3, "refillRatePerSecond": 1}
+          },                                                                                                                                                                                                    
+          {
+              "endpoint": "/upload",                                                                                                                                                                            
+              "algorithm": "SlidingWindowLog",                                                                                                                                                                
+              "algoConfig": {"maxRequests": 2, "windowMs": 5000}                                                                                                                                                
+          }
+      ]                                                                                                                                                                                                         
+                                                                                                                                                                                                              
+      default_config = {
+          "algorithm": "TokenBucket",
+          "algoConfig": {"capacity": 5, "refillRatePerSecond": 1}                                                                                                                                               
+      }
+                                                                                                                                                                                                                
+      rl = RateLimiter(configs, default_config)                                                                                                                                                               
+
+      # Test 1: Token Bucket — /search                                                                                                                                                                          
+      print("=== Token Bucket /search ===")
+      for i in range(5):                                                                                                                                                                                        
+          result = rl.allow("user_123", "/search")                                                                                                                                                              
+          print(f"Request {i+1}: allowed={result.allowed}, "
+                f"remaining={result.remaining}, "                                                                                                                                                               
+                f"retry_after_ms={result.retry_after_ms}")                                                                                                                                                      
+  
+      print()                                                                                                                                                                                                   
+                                                                                                                                                                                                              
+      # Test 2: Sliding Window Log — /upload
+      print("=== Sliding Window /upload ===")
+      for i in range(3):                                                                                                                                                                                        
+          result = rl.allow("user_456", "/upload")
+          print(f"Request {i+1}: allowed={result.allowed}, "                                                                                                                                                    
+                f"remaining={result.remaining}, "                                                                                                                                                               
+                f"retry_after_ms={result.retry_after_ms}")
+                                                                                                                                                                                                                
+      print()                                                                                                                                                                                                 
+
+      # Test 3: Unknown endpoint → default limiter                                                                                                                                                              
+      print("=== Unknown endpoint → default ===")
+      result = rl.allow("user_789", "/unknown")                                                                                                                                                                 
+      print(f"allowed={result.allowed}, remaining={result.remaining}")                                                                                                                                          
+  
+  Output:                                                                                                                                                                                                       
+  === Token Bucket /search ===                                                                                                                                                                                
+  Request 1: allowed=True,  remaining=2, retry_after_ms=None
+  Request 2: allowed=True,  remaining=1, retry_after_ms=None
+  Request 3: allowed=True,  remaining=0, retry_after_ms=None                                                                                                                                                    
+  Request 4: allowed=False, remaining=0, retry_after_ms=1000
+  Request 5: allowed=False, remaining=0, retry_after_ms=1000                                                                                                                                                    
+                                                                                                                                                                                                              
+  === Sliding Window /upload ===                                                                                                                                                                                
+  Request 1: allowed=True,  remaining=1, retry_after_ms=None                                                                                                                                                  
+  Request 2: allowed=True,  remaining=0, retry_after_ms=None                                                                                                                                                    
+  Request 3: allowed=False, remaining=0, retry_after_ms=4999                                                                                                                                                    
+  
+  === Unknown endpoint → default ===                                                                                                                                                                            
+  allowed=True, remaining=4                                                                                                                                                                                   
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                         
+  Step 11 — Thread Safety Extension (For SDE-2 Level)
+                                                                                                                                                                                                                
+  import threading
+                                                                                                                                                                                                                
+  class TokenBucketLimiter(Limiter):                                                                                                                                                                            
+  
+      def __init__(self, capacity: int, refill_rate_per_second: int):                                                                                                                                           
+          self.capacity = capacity                                                                                                                                                                            
+          self.refill_rate = refill_rate_per_second
+          self.buckets: Dict[str, TokenBucket] = {}
+          self._map_lock = threading.Lock()  # protects bucket creation
+                                                                                                                                                                                                                
+      def _get_or_create_bucket(self, key: str) -> TokenBucket:
+          # Lock only for creation — not for the allow logic                                                                                                                                                    
+          with self._map_lock:                                                                                                                                                                                  
+              if key not in self.buckets:
+                  self.buckets[key] = TokenBucket(                                                                                                                                                              
+                      tokens=self.capacity,                                                                                                                                                                   
+                      last_refill_time=self._now(),                                                                                                                                                             
+                      lock=threading.Lock()   # each bucket has own lock                                                                                                                                      
+                  )                                                                                                                                                                                             
+              return self.buckets[key]
+                                                                                                                                                                                                                
+      def allow(self, key: str) -> RateLimitResult:                                                                                                                                                           
+          bucket = self._get_or_create_bucket(key)
+                                                                                                                                                                                                                
+          # Lock per BUCKET not globally
+          # user_123 and user_456 can run concurrently                                                                                                                                                          
+          # only same user blocks same user                                                                                                                                                                     
+          with bucket.lock:                                                                                                                                                                                     
+              now = self._now()                                                                                                                                                                                 
+              elapsed_ms = now - bucket.last_refill_time                                                                                                                                                        
+              tokens_to_add = (elapsed_ms * self.refill_rate) / 1000                                                                                                                                          
+              bucket.tokens = min(self.capacity, bucket.tokens + tokens_to_add)                                                                                                                                 
+              bucket.last_refill_time = now
+                                                                                                                                                                                                                
+              if bucket.tokens >= 1:                                                                                                                                                                          
+                  bucket.tokens -= 1
+                  allowed, remaining, retry_after_ms = True, int(bucket.tokens), None                                                                                                                           
+              else:
+                  tokens_needed = 1 - bucket.tokens                                                                                                                                                             
+                  retry_ms = math.ceil((tokens_needed / self.refill_rate) * 1000)                                                                                                                               
+                  allowed, remaining, retry_after_ms = False, 0, retry_ms
+                                                                                                                                                                                                                
+          # Create result OUTSIDE lock — no need to hold lock for this                                                                                                                                          
+          return RateLimitResult(allowed, remaining, retry_after_ms)                                                                                                                                            
+                                                                                                                                                                                                                
+                                                                                                                                                                                                              
+  @dataclass
+  class TokenBucket:
+      tokens: float                                                                                                                                                                                             
+      last_refill_time: float
+      lock: threading.Lock = field(default_factory=threading.Lock)                                                                                                                                              
+                                                                                                                                                                                                              
+  ---
+  Design Patterns Used — Summary
+                                                                                                                                                                                                                
+  Pattern       Where Used          Why
+  ─────────────────────────────────────────────────────────────────                                                                                                                                             
+  Factory       LimiterFactory      Creates right Limiter from raw config                                                                                                                                     
+                .create()           without caller knowing which class                                                                                                                                          
+                                                                                                                                                                                                                
+  Strategy      Limiter ABC +       Swap algorithms (TokenBucket vs                                                                                                                                             
+                concrete classes    SlidingWindow) without changing RateLimiter                                                                                                                                 
+                                                                                                                                                                                                                
+  Facade        RateLimiter         Hides complexity of factory + algorithms                                                                                                                                    
+                .allow()            behind one simple method call
+                                                                                                                                                                                                                
+  Value Object  RateLimitResult     Immutable, structural equality,                                                                                                                                             
+                (frozen dataclass)  no accidental mutation                                                                                                                                                      
+                                                                                                                                                                                                                
+  Template      _get_or_create_*    Common "get or create" pattern                                                                                                                                              
+  Method        helpers             shared across algorithms                                                                                                                                                    
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                         
+  Algorithm Comparison (Know This for Interview)
+                                                                                                                                                                                                                
+                  Token Bucket        Sliding Window Log
+  ────────────────────────────────────────────────────────                                                                                                                                                      
+  Per-client      tokens (float)      deque of timestamps                                                                                                                                                       
+  state           last_refill_time                                                                                                                                                                              
+                                                                                                                                                                                                                
+  Memory          O(1) per client     O(requests) per client                                                                                                                                                    
+                  always 2 values     grows with request count                                                                                                                                                
+                                                                                                                                                                                                                
+  Accuracy        Approximate         Exact                                                                                                                                                                   
+                  (burst allowed)     (no boundary effects)                                                                                                                                                     
+                                                                                                                                                                                                                
+  Burst support   YES                 NO (strictly N per window)                                                                                                                                                
+                  up to capacity      hard limit                                                                                                                                                                
+                                                                                                                                                                                                                
+  Retry calc      based on tokens     based on oldest timestamp                                                                                                                                                 
+                  needed              expiry time                                                                                                                                                               
+                                                                                                                                                                                                                
+  Best for        APIs that need      APIs needing strict                                                                                                                                                       
+                  burst tolerance     per-minute limits
+                  (search, read)      (write, payment)                                                                                                                                                          
+                                                                                                                                                                                                                
+  Used by         Stripe, AWS         Rate limiting proxies,                                                                                                                                                    
+                  GitHub              auth services                                                                                                                                                             
+                                                                                                                                                                                                                
+  ---                                                                                                                                                                                                         
+  What Interviewer Expects at SDE-2 Level
+                                                                                                                                                                                                                
+  ✓ Clean class boundaries without guidance
+    (RateLimiter orchestrates, algorithms isolated)                                                                                                                                                             
+                                                                                                                                                                                                                
+  ✓ Justify every decision                                                                                                                                                                                      
+    "Why deque not list?" → O(1) vs O(n) popleft                                                                                                                                                                
+    "Why float tokens?" → partial token accumulation                                                                                                                                                            
+    "Why frozen dataclass?" → immutability, no mutation bugs                                                                                                                                                    
+                                                                                                                                                                                                                
+  ✓ Know edge cases                                                                                                                                                                                             
+    "What if client inactive for days?" → huge elapsed → cap at capacity                                                                                                                                        
+    "What if window_ms=0?" → validate in constructor                                                                                                                                                            
+    "Memory leak?" → buckets/logs grow unbounded → mention LRU eviction                                                                                                                                         
+                                                                                                                                                                                                                
+  ✓ Thread safety discussion                                                                                                                                                                                    
+    Per-key locking, not global lock                                                                                                                                                                            
+    Why: different clients don't block each other                                                                                                                                                               
+  
+  ✓ Extensibility                                                                                                                                                                                               
+    Adding FixedWindowCounter = new class + 1 factory case                                                                                                                                                    
+    RateLimiter doesn't change, other algorithms don't change                                                                                                                                                   
+                                                                                                                                                                                                                
+✻ Crunched for 2m 20s  
